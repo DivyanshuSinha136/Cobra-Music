@@ -1,0 +1,33 @@
+// Cobra Music Studio — an advanced music player written entirely in KingCobra.
+//   kingcobra run main.kc                 open the window
+//   kingcobra run main.kc --headless      no display: render frames to PNGs (testing)
+//   kingcobra run main.kc --size 1440x810
+//   KC_MUSIC_SILENT=1 kingcobra run main.kc   simulate playback without an audio device
+import std.game;
+import std.system;
+import "src/app.kc" as app;
+
+fn main() {
+    let args = system.args();
+    var w = 1280;
+    var h = 720;
+    var i = 0;
+    while (i < len(args)) {
+        if (args[i] == "--headless") { game.headless(true); }
+        if (args[i] == "--size" && i + 1 < len(args)) {
+            let p = args[i + 1];
+            for (k in 0..len(p)) {
+                if (p[k] == "x") { w = atoi(p[0..k]); h = atoi(p[k + 1..len(p)]); }
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    w = clamp(w, 1000, 3840);
+    h = clamp(h, 620, 2160);
+    let dir = system.dirname(system.script_path());
+    game.window("Cobra Music Studio", w, h);
+    game.mode("2d");
+    let S = app.create(system.abspath(dir), w, h);
+    app.run(S);
+}
