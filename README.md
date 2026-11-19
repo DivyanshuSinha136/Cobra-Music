@@ -104,7 +104,6 @@ Rendering and playback use the KingCobra standard library only: `std.game` for t
 | Requirement | Notes |
 |---|---|
 | KingCobra 1.0 or newer | `kingcobra --version` |
-| Linux or Windows | developed and tested on Linux (X11 and headless) |
 | An audio player (optional) | one of `pw-play`, `paplay`, `aplay`, `ffplay`, `afplay` (Windows uses the built-in SoundPlayer) |
 | `ffmpeg` (optional) | enables mp3 / flac / ogg / m4a / opus import |
 
