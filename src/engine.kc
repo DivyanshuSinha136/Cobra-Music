@@ -1,0 +1,515 @@
+// engine.kc — the audio engine of Cobra Music Studio.
+//
+// Responsibilities
+//   * obtain audio for a track (render a generated/notation track, load a WAV, convert mp3/flac/ogg with ffmpeg)
+//     — heavy renders run in a BACKGROUND KingCobra process so the window never freezes
+//   * non-blocking playback: the processed audio is written to a temp WAV and handed to the system player
+//     (pw-play / paplay / aplay / ffplay / afplay / Windows SoundPlayer) as a child process we can kill
+//   * a sample-accurate-enough transport clock: play, pause, seek, stop, end-of-track detection
+//   * the DSP chain: 10-band EQ, bass shelf, stereo width, reverb, compressor, limiter, speed (pitch-preserving)
+//   * live analysis for the visualisers (FFT spectrum, waveform overview, VU levels)
+// If no audio device/player exists the engine runs in SILENT mode with a simulated clock, so the whole
+// app stays usable (and testable on a server).
+import std.music_note;
+import std.system;
+import std.io;
+
+const BANDS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const CHUNK = 180.0;     // seconds of audio processed per player run (limits the cost of each re-apply)
+
+fn new(data_dir, app_dir) -> any {
+    let cache = system.path_join(data_dir, "cache");
+    system.mkdir(cache, true);
+    var E = {
+        data_dir: data_dir, app_dir: app_dir, cache_dir: cache,
+        track: null, raw: null, an: null, an_start: 0.0, an_speed: 1.0, an_len: 0.0,
+        dur: 0.0, state: "stopped", pos: 0.0, pos_cache: 0.0, t0: 0.0, p0: 0.0, seg_end: 0.0,
+        proc: null, wav: "", wav_n: 0, player: "silent", silent: false, latency: 0.0, audio_note: "",
+        vol: 0.8, muted: false, speed: 1.0,
+        eq: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], preamp: 0.0, bass: 0.0, width: 1.0, reverb: 0.0,
+        comp: false, limiter: true,
+        dirty_at: -1.0, job: null, want_play: false, ended: false, loading: false, load_msg: "",
+        norm: true, norm_db: 0.0, wave_min: [], wave_max: [], err: "", rendered: 0, last_apply_ms: 0.0, spawn_t: 0.0, prefetch: null
+    };
+    detect_player(E);
+    return E;
+}
+
+// ---------------------------------------------------------------------------------------------
+// player detection / spawning
+// ---------------------------------------------------------------------------------------------
+fn detect_player(E) -> any {
+    E.player = "silent";
+    E.silent = true;
+    E.audio_note = "no audio player found - running silent";
+    let forced = system.getenv("KC_MUSIC_SILENT");
+    if (forced != null && forced == "1") {
+        E.audio_note = "silent mode (KC_MUSIC_SILENT=1)";
+        return 0;
+    }
+    let os = system.os();
+    var names = ["pw-play", "paplay", "aplay", "ffplay", "play"];
+    if (os == "windows") { names = ["powershell"]; }
+    if (os == "macos") { names = ["afplay"]; }
+    for (n in names) {
+        if (n == "powershell" || system.which(n) != null) {
+            E.player = n;
+            E.silent = false;
+            E.audio_note = "output via " + n;
+            if (n == "ffplay") { E.latency = 0.30; }
+            else if (n == "powershell") { E.latency = 0.70; }
+            else if (n == "aplay") { E.latency = 0.06; }
+            else { E.latency = 0.12; }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+fn player_argv(name, path) -> any {
+    if (name == "aplay") { return ["aplay", "-q", path]; }
+    if (name == "ffplay") { return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]; }
+    if (name == "play") { return ["play", "-q", path]; }
+    if (name == "powershell") {
+        return ["powershell", "-NoProfile", "-Command", "(New-Object Media.SoundPlayer '" + path + "').PlaySync()"];
+    }
+    return [name, path];
+}
+
+fn kill_player(E) {
+    if (E.proc != null) {
+        system.kill(E.proc, true);
+        system.proc_free(E.proc);
+        E.proc = null;
+    }
+    if (E.wav != "" && system.exists(E.wav)) { system.remove_file(E.wav); }
+    E.wav = "";
+}
+
+// ---------------------------------------------------------------------------------------------
+// obtaining audio for a track
+// ---------------------------------------------------------------------------------------------
+fn cache_file(E, track) -> any {
+    return system.path_join(E.cache_dir, track.key + ".wav");
+}
+
+fn is_ready(E, track) -> any {
+    if (track.kind == "wav") { return true; }
+    return system.exists(cache_file(E, track));
+}
+
+fn source_path(E, track) -> any {
+    if (track.kind == "wav") { return track.src; }
+    return cache_file(E, track);
+}
+
+fn spawn_job(E, track, quiet) -> any {
+    if (E.job != null) { return false; }
+    let out = cache_file(E, track);
+    var argv = null;
+    let exe = system.exe_path();
+    if (track.kind == "gen") {
+        argv = [exe, "run", system.path_join(E.app_dir, "src", "render_worker.kc"), "gen", track.style, track.opts, out];
+    } else if (track.kind == "kcm") {
+        argv = [exe, "run", system.path_join(E.app_dir, "src", "render_worker.kc"), "kcm", track.src, "", out];
+    } else if (track.kind == "conv") {
+        argv = ["ffmpeg", "-y", "-loglevel", "error", "-i", track.src, "-ar", "44100", "-ac", "2", out];
+    }
+    if (argv == null || exe == null) { return false; }
+    let p = system.spawn(argv, false);
+    if (p == null) { return false; }
+    E.job = { proc: p, track: track, out: out, t0: system.monotonic(), quiet: quiet };
+    return true;
+}
+
+// Ask for a track. Returns "ready" (audio can be loaded now), "pending" (a background job runs) or "error".
+fn request(E, track) -> any {
+    if (is_ready(E, track)) { return "ready"; }
+    if (E.job != null) {
+        if (E.job.track.id == track.id) { return "pending"; }
+        if (E.job.quiet) {
+            // a speculative prefetch is running for another track: drop it, the user wants this one now
+            system.kill(E.job.proc, true);
+            system.proc_free(E.job.proc);
+            let part = E.job.out + ".part";
+            if (system.exists(part)) { system.remove_file(part); }
+            E.job = null;
+        } else {
+            return "pending";
+        }
+    }
+    if (spawn_job(E, track, false)) { return "pending"; }
+    // could not spawn a worker: render synchronously
+    return render_sync(E, track) ? "ready" : "error";
+}
+
+fn render_sync(E, track) -> any {
+    var ok = true;
+    try {
+        var a = null;
+        if (track.kind == "gen") { a = music_note.produce(track.style, track.opts); }
+        else if (track.kind == "kcm") { a = music_note.render(music_note.parse_file(track.src)); }
+        else { ok = false; }
+        if (a != null) {
+            music_note.save_wav(a, cache_file(E, track), "bits=16");
+            music_note.free(a);
+        }
+    } catch (e) {
+        E.err = e.message;
+        ok = false;
+    }
+    return ok;
+}
+
+// Poll the background render job; returns the finished track or null
+fn poll_job(E) -> any {
+    let j = E.job;
+    if (j == null) { return null; }
+    let code = system.poll(j.proc);
+    if (code == null) { return null; }
+    system.proc_free(j.proc);
+    E.job = null;
+    if (code != 0 || !system.exists(j.out)) {
+        E.err = "background render failed (" + j.track.title + ")";
+        return { failed: true, track: j.track };
+    }
+    E.rendered += 1;
+    return { failed: false, track: j.track, quiet: j.quiet };
+}
+
+fn free_audio(E) {
+    if (E.raw != null) { music_note.free(E.raw); E.raw = null; }
+    if (E.an != null) { music_note.free(E.an); E.an = null; }
+}
+
+// Load the (ready) track into memory and make it the current track. Does not start playing.
+fn load(E, track) -> any {
+    kill_player(E);
+    free_audio(E);
+    E.track = track;
+    E.pos = 0.0;
+    E.ended = false;
+    E.state = "stopped";
+    var ok = true;
+    try {
+        E.raw = music_note.load_wav(source_path(E, track));
+        if (music_note.info(E.raw).channels == 1) {
+            let st = music_note.to_stereo(E.raw);
+            music_note.free(E.raw);
+            E.raw = st;
+        }
+        let inf = music_note.info(E.raw);
+        E.dur = inf.seconds;
+        let w = music_note.waveform(E.raw, 720);
+        E.wave_min = w.min;
+        E.wave_max = w.max;
+        compute_norm(E, track);
+    } catch (e) {
+        E.err = e.message;
+        ok = false;
+    }
+    if (!ok) { E.track = null; E.raw = null; }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------------------------
+// DSP chain
+// ---------------------------------------------------------------------------------------------
+fn eq_specs(E) -> any {
+    var specs = [];
+    for (i in 0..10) {
+        let g = E.eq[i];
+        if (abs(g) >= 0.1) {
+            if (i == 0) { push(specs, f"lowshelf freq=60 gain={g}"); }
+            else if (i == 9) { push(specs, f"highshelf freq=11000 gain={g}"); }
+            else { push(specs, f"peak freq={BANDS[i]} gain={g} q=1.0"); }
+        }
+    }
+    if (abs(E.bass) >= 0.1) { push(specs, f"lowshelf freq=110 gain={E.bass}"); }
+    return specs;
+}
+
+// is any effect active? (so we can skip the chain completely when everything is flat)
+fn fx_active(E) -> any {
+    if (abs(E.speed - 1.0) > 0.01 || abs(E.preamp) > 0.05 || abs(E.bass) > 0.05) { return true; }
+    if (abs(E.width - 1.0) > 0.02 || E.reverb > 0.01 || E.comp) { return true; }
+    for (i in 0..10) { if (abs(E.eq[i]) >= 0.1) { return true; } }
+    return false;
+}
+
+fn vol_db(E) -> any {
+    if (E.muted || E.vol <= 0.005) { return -90.0; }
+    return 40.0 * log10(E.vol) + (E.norm ? E.norm_db : 0.0);
+}
+
+// Loudness matching: bring every track to about the same RMS level so you do not have to
+// chase the volume between tracks. The gain is limited so it can never push peaks into clipping.
+fn compute_norm(E, track) -> any {
+    E.norm_db = 0.0;
+    if (E.raw == null || track.kind == "studio") { return 0; }
+    try {
+        let st = music_note.stats(E.raw);
+        if (st.silent) { return 0; }
+        var g = -16.0 - st.rms_db;
+        g = clamp(g, -9.0, 9.0);
+        if (st.peak_db + g > -1.0) { g = -1.0 - st.peak_db; }
+        E.norm_db = g;
+    } catch (e) { E.norm_db = 0.0; }
+}
+
+// Keep the render cache under `max_mb`: delete the oldest files first (never the one in use).
+fn trim_cache(E, max_mb) -> any {
+    let names = system.list_dir(E.cache_dir);
+    if (names == null) { return 0; }
+    var files = [];
+    var total = 0;
+    for (n in names) {
+        let p = system.path_join(E.cache_dir, n);
+        let st = system.stat(p);
+        if (st != null && st.is_file) { push(files, { p: p, size: st.size, t: st.mtime }); total += st.size; }
+    }
+    let limit = max_mb * 1048576;
+    var removed = 0;
+    while (total > limit && len(files) > 0) {
+        var oi = 0;
+        for (i in 0..len(files)) { if (files[i].t < files[oi].t) { oi = i; } }
+        let f = files[oi];
+        files = lib_remove_at(files, oi);
+        if (E.track != null && f.p == source_path(E, E.track)) { continue; }
+        system.remove_file(f.p);
+        total -= f.size;
+        removed += 1;
+    }
+    return removed;
+}
+
+fn cache_bytes(E) -> any {
+    var total = 0;
+    let names = system.list_dir(E.cache_dir);
+    if (names == null) { return 0; }
+    for (n in names) {
+        let st = system.stat(system.path_join(E.cache_dir, n));
+        if (st != null && st.is_file) { total += st.size; }
+    }
+    return total;
+}
+
+fn lib_remove_at(arr, i) -> any {
+    var out = [];
+    for (k in 0..len(arr)) { if (k != i) { push(out, arr[k]); } }
+    return out;
+}
+
+// build the processed audio for [pos, pos+CHUNK) — returns the analysis buffer (post-FX, pre-volume)
+fn process(E, pos) -> any {
+    let end = min(E.dur, pos + CHUNK);
+    var a = music_note.slice(E.raw, f"start={pos} end={end}");
+    if (abs(E.speed - 1.0) > 0.01) {
+        let b = music_note.time_stretch(a, 1.0 / E.speed);
+        music_note.free(a);
+        a = b;
+    }
+    if (abs(E.width - 1.0) > 0.02) {
+        let b = music_note.width(a, E.width);
+        music_note.free(a);
+        a = b;
+    }
+    var specs = eq_specs(E);
+    if (E.comp) { push(specs, "compressor threshold=-20 ratio=3 attack=0.01 release=0.15"); }
+    if (E.reverb > 0.01) { push(specs, f"reverb mix={E.reverb} room=0.7 damp=0.5"); }
+    if (abs(E.preamp) > 0.05) { push(specs, f"gain db={E.preamp}"); }
+    if (len(specs) > 0) {
+        let b = music_note.chain(a, specs);
+        music_note.free(a);
+        a = b;
+    }
+    if (E.limiter && fx_active(E)) {
+        let b = music_note.limiter(a, "ceiling=-0.8");
+        music_note.free(a);
+        a = b;
+    }
+    return a;
+}
+
+// ---------------------------------------------------------------------------------------------
+// transport
+// ---------------------------------------------------------------------------------------------
+fn position(E) -> any {
+    if (E.state == "playing") {
+        let el = system.monotonic() - E.t0 - E.latency;
+        let p = E.p0 + (el > 0.0 ? el : 0.0) * E.speed;
+        return p > E.dur ? E.dur : p;
+    }
+    return E.pos;
+}
+
+fn start_at(E, pos0) -> any {
+    if (E.raw == null) { return false; }
+    var pos = clamp(pos0, 0.0, E.dur);
+    if (pos >= E.dur - 0.05) { pos = max(0.0, E.dur - 0.05); }
+    let t_start = system.monotonic();
+    kill_player(E);
+    if (E.an != null) { music_note.free(E.an); E.an = null; }
+    var ok = true;
+    try {
+        E.an = process(E, pos);
+        E.an_start = pos;
+        E.an_speed = E.speed;
+        E.an_len = music_note.info(E.an).seconds;
+        E.seg_end = min(E.dur, pos + CHUNK);
+        if (!E.silent) {
+            let out = music_note.gain(E.an, vol_db(E));
+            E.wav_n += 1;
+            E.wav = system.path_join(system.temp_dir(), f"cobra_music_{system.pid()}_{E.wav_n}.wav");
+            music_note.save_wav(out, E.wav, "bits=16 dither=false");
+            music_note.free(out);
+            E.proc = system.spawn(player_argv(E.player, E.wav), false);
+            if (E.proc == null) {
+                E.silent = true;
+                E.audio_note = "could not start " + E.player + " - running silent";
+            }
+        }
+    } catch (e) {
+        E.err = e.message;
+        ok = false;
+    }
+    if (!ok) { E.state = "stopped"; return false; }
+    E.p0 = pos;
+    E.pos = pos;
+    E.t0 = system.monotonic();
+    E.spawn_t = E.t0;
+    E.state = "playing";
+    E.dirty_at = -1.0;
+    E.last_apply_ms = (E.t0 - t_start) * 1000.0;
+    return true;
+}
+
+fn play(E) -> any {
+    if (E.raw == null) { return false; }
+    if (E.state == "playing") { return true; }
+    var from_pos = E.pos;
+    if (E.ended || from_pos >= E.dur - 0.1) { from_pos = 0.0; E.ended = false; }
+    return start_at(E, from_pos);
+}
+
+fn pause(E) -> any {
+    if (E.state != "playing") { return 0; }
+    E.pos = position(E);
+    kill_player(E);
+    E.state = "paused";
+}
+
+fn toggle(E) -> any {
+    if (E.state == "playing") { pause(E); return 0; }
+    play(E);
+}
+
+fn stop(E) {
+    kill_player(E);
+    E.state = "stopped";
+    E.pos = 0.0;
+}
+
+fn seek(E, t) -> any {
+    if (E.raw == null) { return 0; }
+    let p = clamp(t, 0.0, E.dur);
+    if (E.state == "playing") { start_at(E, p); }
+    else { E.pos = p; E.ended = false; }
+}
+
+// mark settings as changed: the audio is re-rendered shortly (debounced) if playing
+fn changed(E) {
+    if (E.state == "playing") { E.dirty_at = system.monotonic() + 0.25; }
+}
+
+// call every frame; `busy` = the user is dragging a control (postpone re-render)
+fn tick(E, busy) -> any {
+    if (E.state == "playing") {
+        let now = system.monotonic();
+        let p = position(E);
+        // simulated clock in silent mode, real player otherwise
+        if (E.proc != null) {
+            let code = system.poll(E.proc);
+            if (code != null) {
+                let elapsed = now - E.spawn_t;
+                system.proc_free(E.proc);
+                E.proc = null;
+                if (elapsed < 1.5 && (E.seg_end - E.p0) / E.speed > 3.0) {
+                    E.silent = true;
+                    E.audio_note = E.player + " failed (no audio device?) - running silent";
+                    E.t0 = E.spawn_t;
+                } else if (E.seg_end < E.dur - 0.2) {
+                    start_at(E, E.seg_end);
+                } else {
+                    E.pos = E.dur;
+                    E.state = "stopped";
+                    E.ended = true;
+                    return 0;
+                }
+            }
+        } else if (p >= E.seg_end - 0.001) {
+            if (E.seg_end < E.dur - 0.2) { start_at(E, E.seg_end); }
+            else { E.pos = E.dur; E.state = "stopped"; E.ended = true; return 0; }
+        }
+        if (E.dirty_at > 0.0 && now >= E.dirty_at && !busy) { start_at(E, position(E)); }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// analysis for the visualisers
+// ---------------------------------------------------------------------------------------------
+// FFT magnitude spectrum (dB array) at the current playback position, or null
+fn spectrum(E, size) -> any {
+    if (E.an == null) { return null; }
+    let p = position(E);
+    var tp = (p - E.an_start) / E.an_speed - 0.03;
+    if (tp < 0.0) { tp = 0.0; }
+    if (tp > E.an_len - 0.06) { return null; }
+    let sp = music_note.spectrum(E.an, f"size={size} start={tp} window=hann");
+    return sp;
+}
+
+// left/right sample windows for scopes / VU; returns { l: [...], r: [...] } or null
+fn scope(E, count) -> any {
+    if (E.an == null) { return null; }
+    let p = position(E);
+    var tp = (p - E.an_start) / E.an_speed - 0.02;
+    if (tp < 0.0) { tp = 0.0; }
+    if (tp > E.an_len - 0.05) { return null; }
+    let ch = music_note.info(E.an).channels;
+    let l = music_note.samples(E.an, f"channel=0 start={tp} count={count}");
+    var r = l;
+    if (ch > 1) { r = music_note.samples(E.an, f"channel=1 start={tp} count={count}"); }
+    return { l: l, r: r };
+}
+
+// Render the current track through the current FX and save it as a WAV
+fn export_wav(E, path) -> any {
+    if (E.raw == null) { return false; }
+    var ok = true;
+    try {
+        let save_dur = E.dur;
+        var a = music_note.slice(E.raw, f"start=0 end={save_dur}");
+        var specs = eq_specs(E);
+        if (E.comp) { push(specs, "compressor threshold=-20 ratio=3"); }
+        if (E.reverb > 0.01) { push(specs, f"reverb mix={E.reverb} room=0.7 damp=0.5"); }
+        if (abs(E.preamp) > 0.05) { push(specs, f"gain db={E.preamp}"); }
+        if (len(specs) > 0) { let b = music_note.chain(a, specs); music_note.free(a); a = b; }
+        if (abs(E.speed - 1.0) > 0.01) { let b = music_note.time_stretch(a, 1.0 / E.speed); music_note.free(a); a = b; }
+        let b = music_note.limiter(a, "ceiling=-0.8");
+        music_note.free(a);
+        music_note.save_wav(b, path, "bits=16");
+        music_note.free(b);
+    } catch (e) {
+        E.err = e.message;
+        ok = false;
+    }
+    return ok;
+}
+
+fn shutdown(E) {
+    kill_player(E);
+    if (E.job != null) { system.kill(E.job.proc, true); system.proc_free(E.job.proc); E.job = null; }
+    free_audio(E);
+}

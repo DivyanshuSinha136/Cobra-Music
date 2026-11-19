@@ -1,0 +1,23 @@
+title "Cobra Strike"
+composer Cobra Labs
+tempo 150
+time 4/4
+key Em
+
+track arp pluck vol=0.8 delay=0.25 delay_time=0.5
+|: E4:s G4:s B4:s E5:s B4:s G4:s E4:s G4:s  C4:s E4:s G4:s C5:s G4:s E4:s C4:s E4:s :|x4
+|: D4:s F#4:s A4:s D5:s A4:s F#4:s D4:s F#4:s  B3:s D4:s F#4:s B4:s F#4:s D4:s B3:s D4:s :|x4
+
+track lead saw vol=0.55 reverb=0.2
+o5
+r:w r:w r:w r:w
+E5:q G5:q B5:h  A5:q G5:q E5:h
+D5:q F#5:q A5:h  G5:q F#5:q B4:h
+
+track bass bass vol=0.9
+o2
+|: E2:e E2:e E3:e E2:e E2:e E2:e G2:e E2:e :|x4
+|: D2:e D2:e D3:e D2:e D2:e D2:e F#2:e D2:e :|x4
+
+track drums drums vol=0.8
+|: kick:q snare:q kick:q snare:q :|x8

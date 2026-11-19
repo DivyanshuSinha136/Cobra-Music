@@ -1,0 +1,112 @@
+// app.kc — builds the application, runs one frame (input -> update -> draw), keyboard shortcuts.
+import std.game;
+import std.system;
+import "ui.kc" as ui;
+import "core.kc" as core;
+import "engine.kc" as engine;
+import "viz.kc" as viz;
+import "views.kc" as views;
+import "views2.kc" as views2;
+import "views3.kc" as views3;
+
+fn create(app_dir, w, h) -> any {
+    var dd = system.getenv("KC_MUSIC_HOME");
+    if (dd == null || dd == "") {
+        let home = system.home_dir();
+        dd = system.path_join(home != null ? home : system.temp_dir(), ".cobra_music");
+    }
+    system.setenv("KC_MUSIC_APP", app_dir);
+    let S = core.new_state(dd, app_dir);
+    S.U.W = w;
+    S.U.H = h;
+    core.init(S);
+    return S;
+}
+
+fn keys(S) -> any {
+    let U = S.U;
+    if (U.focus != "" || S.modal != null) { return 0; }
+    let E = S.E;
+    if (game.key_pressed("space")) { core.toggle_play(S); }
+    let sh = game.key("shift");
+    if (game.key_pressed("right")) { core.seek_by(S, sh ? 15.0 : 5.0); }
+    if (game.key_pressed("left")) { core.seek_by(S, sh ? -15.0 : -5.0); }
+    if (game.key_pressed("up")) { core.set_volume(S, E.vol + 0.05); }
+    if (game.key_pressed("down")) { core.set_volume(S, E.vol - 0.05); }
+    if (game.key_pressed("n")) { core.advance(S, 1, false); }
+    if (game.key_pressed("p")) { core.advance(S, -1, false); }
+    if (game.key_pressed("s")) { core.set_shuffle(S, !S.settings.shuffle); }
+    if (game.key_pressed("r")) { core.cycle_repeat(S); }
+    if (game.key_pressed("m")) { core.toggle_mute(S); }
+    if (game.key_pressed("f") && E.track != null) { core.toggle_fav(S, E.track); }
+    let ids = ["library", "playlists", "queue", "viz", "eq", "score", "studio", "settings"];
+    let names = ["1", "2", "3", "4", "5", "6", "7", "8"];
+    for (i in 0..8) { if (game.key_pressed(names[i])) { S.view = ids[i]; } }
+    if (game.key_pressed("slash")) { S.view = "library"; U.focus = "search"; }
+}
+
+// one complete frame, guarded: a bug in one screen must never kill the player (and the music keeps playing).
+fn frame(S, dt) {
+    try {
+        frame_inner(S, dt);
+    } catch (e) {
+        ui.clip_reset(S.U);
+        S.U.lock = false;
+        S.U.menu = null;
+        let msg = typeof(e) == "string" ? e : e.message;
+        core.log_error(S, "view " + S.view, msg);
+        ui.toast(S.U, "Recovered from an error (see error.log)");
+        if (core.fault_storm(S)) { S.view = "library"; S.modal = null; S.errors = []; }
+    }
+}
+
+fn frame_inner(S, dt) {
+    if (S.fault) { S.fault = false; throw "injected test fault"; }
+    let U = S.U;
+    ui.begin(U, S.T, dt);
+    core.tick(S, dt);
+    viz.update(S.V, S.E, dt, S.view == "viz" || S.E.state == "playing");
+    keys(S);
+    U.lock = U.lock || S.modal != null;
+    game.clear(S.T.bg);
+    let x = views.SIDE_W;
+    let y = views.TOP_H;
+    let w = U.W - x;
+    let h = U.H - views.TOP_H - views.PLAYER_H;
+    game.clip(x, y, w, h);
+    ui.clip_set(U, x, y, w, h);
+    if (S.view == "library") { views.view_library(S, x, y, w, h); }
+    else if (S.view == "playlists") { views.view_playlists(S, x, y, w, h); }
+    else if (S.view == "queue") { views.view_queue(S, x, y, w, h); }
+    else if (S.view == "viz") { views2.view_viz(S, x, y, w, h); }
+    else if (S.view == "eq") { views2.view_eq(S, x, y, w, h); }
+    else if (S.view == "studio") { views3.view_studio(S, x, y, w, h); }
+    else if (S.view == "score") { views2.view_score(S, x, y, w, h); }
+    else { views2.view_settings(S, x, y, w, h); }
+    ui.clip_reset(U);
+    views.draw_sidebar(S);
+    views.draw_topbar(S);
+    views.draw_player(S);
+    views.handle_menus(S);
+    let had_modal = S.modal != null;
+    U.lock = false;
+    if (had_modal) { views2.draw_modal(S); U.lock = U.menu != null; }
+    ui.finish(U);
+}
+
+fn run(S) {
+    game.target_fps(60);
+    var last = system.monotonic();
+    while (game.poll()) {
+        let now = system.monotonic();
+        var dt = now - last;
+        last = now;
+        if (dt > 0.1) { dt = 0.1; }
+        if (game.key_pressed("escape") && S.U.focus == "" && S.modal == null && S.U.menu == null && S.view == "library" && len(S.query) == 0) {
+            // Esc on the library does nothing; closing the window quits
+        }
+        frame(S, dt);
+        game.present();
+    }
+    core.shutdown(S);
+}

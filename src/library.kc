@@ -1,0 +1,364 @@
+// library.kc — the track catalogue, folder scanning, searching/sorting, favourites, playlists, persistence.
+import std.music_note;
+import std.system;
+import std.json;
+
+// Built-in tracks: rule-based arrangements from music_note.groove/produce (seeded => reproducible).
+fn builtin_specs() -> any {
+    return [
+        { title: "Midnight Drift",   artist: "Cobra Labs", album: "Night Shift",  genre: "Phonk", style: "drift_phonk",      opts: "bars=24 bpm=148 key=Dm seed=7" },
+        { title: "Neon Cowbell",     artist: "Cobra Labs", album: "Night Shift",  genre: "Phonk", style: "phonk",            opts: "bars=16 bpm=138 key=F#m seed=3" },
+        { title: "Chrome Highway",   artist: "Cobra Labs", album: "Night Shift",  genre: "Phonk", style: "drift_phonk",      opts: "bars=16 bpm=152 key=Gm seed=21 intensity=0.9" },
+        { title: "Slow Burn",        artist: "Cobra Labs", album: "Night Shift",  genre: "Phonk", style: "phonk",            opts: "bars=16 bpm=120 key=Bm seed=9 scale=phrygian" },
+        { title: "Tamborzao Heat",   artist: "Cobra Labs", album: "Carioca",      genre: "Funk",  style: "brazilian_phonk",  opts: "bars=16 bpm=130 key=Am seed=5" },
+        { title: "Sunday Slap",      artist: "Cobra Labs", album: "Groove Lab",   genre: "Funk",  style: "funk",             opts: "bars=24 bpm=104 key=Em seed=11" },
+        { title: "Velvet Groove",    artist: "Cobra Labs", album: "Groove Lab",   genre: "Funk",  style: "funk",             opts: "bars=16 bpm=96 key=Cm seed=2 intensity=0.6 swing=0.4" },
+        { title: "Funk Lab No. 4",   artist: "Cobra Labs", album: "Groove Lab",   genre: "Funk",  style: "funk",             opts: "bars=32 bpm=110 key=Am seed=4 intensity=0.8" }
+    ];
+}
+
+fn ascii(s) -> any {
+    var out = "";
+    for (c in s) {
+        let ch = ord(c);
+        if (ch >= 32 && ch < 127) { out = out + chr(ch); } else if (ch == 9) { out = out + " "; } else if (ch < 128) { } else { if ((ch & 0xC0) != 0x80) { out = out + "?"; } }
+    }
+    return out;
+}
+
+fn slug(s) -> any {
+    var out = "";
+    for (c in s) {
+        let ch = ord(c);
+        if ((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) { out = out + chr(ch); } else { out = out + "_"; }
+    }
+    return out;
+}
+
+fn hash(s) -> any {
+    var h = 5381;
+    for (c in s) { h = (h * 33 + ord(c)) & 0x7fffffff; }
+    return h;
+}
+
+fn make_track(id, key, title, artist, album, genre, kind, src, style, opts, dur) -> any {
+    return {
+        id: id, key: key, title: ascii(title), artist: ascii(artist), album: ascii(album), genre: ascii(genre), kind: kind, src: src,
+        style: style, opts: opts, dur: dur, fav: false, plays: 0, seed: hash(id) % 997, added: 0
+    };
+}
+
+fn builtin_tracks() -> any {
+    var out = [];
+    let specs = builtin_specs();
+    for (i in 0..len(specs)) {
+        let s = specs[i];
+        let id = "gen:" + slug(s.title);
+        var dur = 0.0;
+        try {
+            dur = music_note.score_info(music_note.groove(s.style, s.opts)).seconds + 1.5;
+        } catch (e) {
+            dur = 0.0;
+        }
+        push(out, make_track(id, "gen_" + slug(s.title) + "_" + hash(s.style + s.opts), s.title, s.artist, s.album, s.genre, "gen", "", s.style, s.opts, dur));
+    }
+    return out;
+}
+
+fn ext_of(name) -> any {
+    let e = system.extension(name);
+    if (e == null) { return ""; }
+    return tolower_str(e);
+}
+
+fn tolower_str(s) -> any {
+    var out = "";
+    for (c in s) { out = out + chr(tolower(ord(c))); }
+    return out;
+}
+
+fn scan_dir(dir, depth, out, have_ffmpeg) -> any {
+    if (len(out) > 400 || !system.is_dir(dir)) { return 0; }
+    let names = system.list_dir(dir);
+    if (names == null) { return 0; }
+    for (n in names) {
+        let p = system.path_join(dir, n);
+        if (system.is_dir(p)) {
+            if (depth > 0 && n[0] != '.') { scan_dir(p, depth - 1, out, have_ffmpeg); }
+        } else {
+            let ext = ext_of(n);
+            let stem = system.stem(n);
+            var size = 0;
+            let st = system.stat(p);
+            if (st != null) { size = st.size; }
+            if (ext == ".kcm") {
+                var title = stem;
+                var composer = "KingCobra Score";
+                var dur = 0.0;
+                try {
+                    let inf = music_note.score_info(music_note.parse_file(p));
+                    if (len(inf.title) > 0) { title = inf.title; }
+                    if (len(inf.composer) > 0) { composer = inf.composer; }
+                    dur = inf.seconds + 1.5;
+                } catch (e) {
+                    title = stem + " (error)";
+                }
+                push(out, make_track("kcm:" + p, "kcm_" + slug(stem) + "_" + size, title, composer, "Notation scores", "Score", "kcm", p, "", "", dur));
+            } else if (ext == ".wav") {
+                var dur = 0.0;
+                try { dur = music_note.wav_info(p).seconds; } catch (e) { dur = 0.0; }
+                push(out, make_track("wav:" + p, "", stem, "Unknown artist", system.basename(dir), "Audio", "wav", p, "", "", dur));
+            } else if (have_ffmpeg && (ext == ".mp3" || ext == ".flac" || ext == ".ogg" || ext == ".m4a" || ext == ".opus" || ext == ".aac")) {
+                push(out, make_track("conv:" + p, "conv_" + slug(stem) + "_" + size, stem, "Unknown artist", system.basename(dir), "Audio", "conv", p, "", "", 0.0));
+            }
+        }
+    }
+    return 0;
+}
+
+fn scan_folders(folders) -> any {
+    var out = [];
+    let ff = system.which("ffmpeg") != null;
+    for (f in folders) { scan_dir(f, 2, out, ff); }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// building / refreshing the catalogue
+// ---------------------------------------------------------------------------------------------
+fn rebuild(S) {
+    var tracks = builtin_tracks();
+    let scanned = scan_folders(S.settings.folders);
+    for (t in scanned) { push(tracks, t); }
+    for (i in 0..len(tracks)) {
+        let t = tracks[i];
+        t.fav = (t.id in S.favs) && S.favs[t.id];
+        t.plays = t.id in S.plays ? S.plays[t.id] : 0;
+        t.added = i;
+    }
+    S.tracks = tracks;
+    S.byid = {};
+    for (t in tracks) { S.byid[t.id] = t; }
+    S.list_sig = "";
+}
+
+fn find(S, id) -> any {
+    if (id in S.byid) { return S.byid[id]; }
+    return null;
+}
+
+fn set_fav(S, t, on) {
+    t.fav = on;
+    S.favs[t.id] = on;
+    S.fav_rev += 1;
+    S.list_sig = "";
+}
+
+fn count_play(S, t) {
+    t.plays += 1;
+    S.plays[t.id] = t.plays;
+}
+
+// ---------------------------------------------------------------------------------------------
+// filtered + sorted view (cached by a signature so it is rebuilt only when something changed)
+// ---------------------------------------------------------------------------------------------
+fn matches(t, q) -> any {
+    if (len(q) == 0) { return true; }
+    let hay = tolower_str(t.title + " " + t.artist + " " + t.album + " " + t.genre);
+    // every word of the query must occur
+    var start = 0;
+    let n = len(q);
+    var i = 0;
+    while (i <= n) {
+        if (i == n || q[i] == " ") {
+            if (i > start) {
+                let w = q[start..i];
+                if (!(w in hay)) { return false; }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn key_of(t, col) -> any {
+    if (col == "title") { return tolower_str(t.title); }
+    if (col == "artist") { return tolower_str(t.artist); }
+    if (col == "album") { return tolower_str(t.album); }
+    if (col == "genre") { return tolower_str(t.genre); }
+    if (col == "time") { return t.dur; }
+    if (col == "plays") { return t.plays; }
+    return t.added;
+}
+
+fn less(a, b, col, asc) -> any {
+    let ka = key_of(a, col);
+    let kb = key_of(b, col);
+    if (ka == kb) { return a.added < b.added; }
+    var lt = false;
+    if (typeof(ka) == "string") { lt = strcmp(ka, kb) < 0; } else { lt = ka < kb; }
+    return asc ? lt : !lt;
+}
+
+// stable merge sort on an array of tracks
+fn sort_tracks(arr, col, asc) -> any {
+    let n = len(arr);
+    if (n < 2) { return arr; }
+    let mid = idiv(n, 2);
+    let l = sort_tracks(arr[0..mid], col, asc);
+    let r = sort_tracks(arr[mid..n], col, asc);
+    var out = [];
+    var i = 0;
+    var j = 0;
+    while (i < len(l) && j < len(r)) {
+        if (less(r[j], l[i], col, asc)) { push(out, r[j]); j += 1; } else { push(out, l[i]); i += 1; }
+    }
+    while (i < len(l)) { push(out, l[i]); i += 1; }
+    while (j < len(r)) { push(out, r[j]); j += 1; }
+    return out;
+}
+
+fn genres(S) -> any {
+    var out = ["All", "Favorites"];
+    for (t in S.tracks) { if (!(t.genre in out)) { push(out, t.genre); } }
+    return out;
+}
+
+fn view_list(S) -> any {
+    let sig = S.query + "|" + S.genre + "|" + S.sort_col + "|" + (S.sort_asc ? "a" : "d") + "|" + len(S.tracks) + "|" + S.fav_rev;
+    if (sig == S.list_sig) { return S.list; }
+    var out = [];
+    for (t in S.tracks) {
+        var ok = matches(t, S.query);
+        if (ok && S.genre == "Favorites") { ok = t.fav; }
+        else if (ok && S.genre != "All") { ok = t.genre == S.genre; }
+        if (ok) { push(out, t); }
+    }
+    S.list = sort_tracks(out, S.sort_col, S.sort_asc);
+    S.list_sig = sig;
+    return S.list;
+}
+
+// ---------------------------------------------------------------------------------------------
+// playlists
+// ---------------------------------------------------------------------------------------------
+fn playlist_new(S, name) -> any {
+    var nm = ascii(name);
+    if (len(nm) == 0) { nm = "Playlist " + (len(S.playlists) + 1); }
+    push(S.playlists, { name: nm, ids: [] });
+    return len(S.playlists) - 1;
+}
+
+fn playlist_tracks(S, idx) -> any {
+    var out = [];
+    if (idx < 0 || idx >= len(S.playlists)) { return out; }
+    for (id in S.playlists[idx].ids) {
+        let t = find(S, id);
+        if (t != null) { push(out, t); }
+    }
+    return out;
+}
+
+fn playlist_add(S, idx, t) -> any {
+    if (idx < 0 || idx >= len(S.playlists)) { return false; }
+    let p = S.playlists[idx];
+    if (t.id in p.ids) { return false; }
+    push(p.ids, t.id);
+    return true;
+}
+
+fn array_remove_at(arr, i) -> any {
+    var out = [];
+    for (k in 0..len(arr)) { if (k != i) { push(out, arr[k]); } }
+    return out;
+}
+
+fn array_move(arr, i, j) -> any {
+    if (i < 0 || j < 0 || i >= len(arr) || j >= len(arr)) { return arr; }
+    var out = [];
+    for (k in 0..len(arr)) { push(out, arr[k]); }
+    let v = out[i];
+    out[i] = out[j];
+    out[j] = v;
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// persistence (JSON in the data directory)
+// ---------------------------------------------------------------------------------------------
+fn state_path(S) -> any {
+    return system.path_join(S.data_dir, "state.json");
+}
+
+fn ids_of(obj) -> any {
+    var out = [];
+    for (k in obj) { if (obj[k]) { push(out, k); } }
+    return out;
+}
+
+fn save(S, E) -> any {
+    let st = {
+        settings: S.settings,
+        eq: E.eq, vol: E.vol, muted: E.muted, speed: E.speed, preamp: E.preamp, bass: E.bass, width: E.width,
+        reverb: E.reverb, comp: E.comp, limiter: E.limiter,
+        favs: ids_of(S.favs), plays: S.plays, playlists: S.playlists, recent: S.recent,
+        last: E.track != null ? E.track.id : "", last_pos: E.state == "stopped" ? 0.0 : E.pos
+    };
+    try {
+        json.write_file(state_path(S), st, 2);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// make sure a (possibly hand-edited or older) state file cannot put the app in an impossible state
+fn sanitize(S, E, theme_names) {
+    let st = S.settings;
+    if (!(st.theme in theme_names)) { st.theme = "Midnight"; }
+    st.viz_mode = clamp(int(st.viz_mode), 0, 5);
+    st.viz_pal = clamp(int(st.viz_pal), 0, 4);
+    st.repeat = clamp(int(st.repeat), 0, 2);
+    if (typeof(st.folders) != "array") { st.folders = []; }
+    var fl = [];
+    for (f in st.folders) { if (typeof(f) == "string") { push(fl, f); } }
+    st.folders = fl;
+    st.cache_mb = clamp(int(st.cache_mb), 50, 4000);
+    E.vol = clamp(E.vol, 0.0, 1.0);
+    E.speed = clamp(E.speed, 0.5, 1.5);
+    E.preamp = clamp(E.preamp, -12.0, 12.0);
+    E.bass = clamp(E.bass, -10.0, 10.0);
+    E.width = clamp(E.width, 0.0, 2.0);
+    E.reverb = clamp(E.reverb, 0.0, 0.6);
+    for (i in 0..10) { E.eq[i] = clamp(E.eq[i], -12.0, 12.0); }
+    E.norm = st.normalize;
+}
+
+fn load_state(S, E) -> any {
+    let p = state_path(S);
+    if (!system.exists(p)) { return false; }
+    var st = null;
+    try { st = json.parse_file(p); } catch (e) { return false; }
+    if (st == null) { return false; }
+    if ("settings" in st) {
+        let s = st.settings;
+        for (k in s) { S.settings[k] = s[k]; }
+    }
+    if ("eq" in st && len(st.eq) == 10) { for (i in 0..10) { E.eq[i] = st.eq[i] * 1.0; } }
+    if ("vol" in st) { E.vol = st.vol * 1.0; }
+    if ("muted" in st) { E.muted = st.muted; }
+    if ("speed" in st) { E.speed = st.speed * 1.0; }
+    if ("preamp" in st) { E.preamp = st.preamp * 1.0; }
+    if ("bass" in st) { E.bass = st.bass * 1.0; }
+    if ("width" in st) { E.width = st.width * 1.0; }
+    if ("reverb" in st) { E.reverb = st.reverb * 1.0; }
+    if ("comp" in st) { E.comp = st.comp; }
+    if ("limiter" in st) { E.limiter = st.limiter; }
+    if ("favs" in st) { for (id in st.favs) { S.favs[id] = true; } }
+    if ("plays" in st) { for (id in st.plays) { S.plays[id] = st.plays[id]; } }
+    if ("playlists" in st) { S.playlists = st.playlists; }
+    if ("recent" in st) { S.recent = st.recent; }
+    if ("last" in st) { S.last_id = st.last; }
+    return true;
+}

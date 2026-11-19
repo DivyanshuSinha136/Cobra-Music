@@ -1,0 +1,24 @@
+title "Glass Rain"
+composer Cobra Labs
+tempo 78
+time 4/4
+swing=0.2
+
+track keys epiano vol=0.85 reverb=0.35 chorus=0.3
+{Dmaj7}:h {Bm7}:h {Gmaj7}:h {A7sus4}:h
+{Dmaj7}:h {Bm7}:h {Em7}:h {A7}:h
+
+track lead bell vol=0.5 reverb=0.5 delay=0.3 delay_time=0.75
+o5
+r:h F#5:q A5:q  r:q E5:q D5:h
+r:h B4:q D5:q   r:q C#5:q B4:h
+F#5:q A5:q B5:h  A5:q G5:q F#5:h
+E5:q F#5:q G5:q A5:q  D5:w
+
+track bass bass vol=0.8
+o2
+D2:h A2:h B1:h F#2:h G2:h D3:h A2:h E3:h
+D2:h A2:h B1:h F#2:h E2:h B2:h A2:h E3:h
+
+track drums drums vol=0.7
+|: kick:q hat:e hat:e snare:q hat:e hat:e :|x8

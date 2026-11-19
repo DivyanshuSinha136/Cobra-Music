@@ -1,0 +1,103 @@
+// screenshots.kc — renders the screenshots used in README.md headlessly (no display, no audio device needed).
+//   kingcobra run tools/screenshots.kc [output_dir]        default: docs/screenshots/raw
+// Raw PNGs are uncompressed; tools/optimize_png.py (optional) shrinks them.
+import std.game;
+import std.system;
+import "../src/app.kc" as app;
+import "../src/core.kc" as core;
+import "../src/library.kc" as lib;
+import "../src/studio.kc" as studio;
+import "../src/views3.kc" as views3;
+
+fn step(S, n, nap) {
+    for (i in 0..n) { game.poll(); app.frame(S, 0.033); game.present(); if (nap > 0.0) { system.sleep(nap); } }
+}
+
+fn wait_ready(S) {
+    var n = 0;
+    while (S.loading != null && n < 900) { step(S, 1, 0.05); n += 1; }
+}
+
+fn shot(S, out, name) {
+    game.screenshot(system.path_join(out, name + ".png"));
+    print("wrote", name);
+}
+
+fn main() {
+    let root = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+    let args = system.args();
+    let out = len(args) > 0 ? args[0] : system.path_join(root, "docs", "screenshots", "raw");
+    system.mkdir(out, true);
+    let home = system.path_join(system.temp_dir(), "cobra_music_shots_" + system.pid());
+    system.setenv("KC_MUSIC_SILENT", "1");
+    system.setenv("KC_MUSIC_HOME", home);
+    game.headless(true);
+    game.window("Cobra Music Studio", 1280, 720);
+    game.mode("2d");
+    let S = app.create(root, 1280, 720);
+    step(S, 3, 0.0);
+
+    // a playlist for the playlists screen
+    let idx = lib.playlist_new(S, "Late Night Drive");
+    for (t in S.tracks) { if (len(lib.playlist_tracks(S, idx)) < 5 && t.genre != "Score") { lib.playlist_add(S, idx, t); } }
+    lib.set_fav(S, S.tracks[0], true);
+    lib.set_fav(S, S.tracks[4], true);
+
+    // 1. player (library) with a track playing
+    let list = lib.view_list(S);
+    core.play_ctx(S, list[0], list);
+    wait_ready(S);
+    step(S, 70, 0.03);
+    S.sel = list[2].id;
+    shot(S, out, "player");
+
+    // 2. visualiser: bars, then radial in the Neon theme
+    S.view = "viz"; S.settings.viz_mode = 0; S.settings.viz_pal = 0;
+    step(S, 25, 0.03);
+    shot(S, out, "visualizer-bars");
+    core.set_theme(S, "Neon"); S.settings.viz_mode = 3; S.settings.viz_pal = 1;
+    step(S, 25, 0.03);
+    shot(S, out, "visualizer-radial");
+    core.set_theme(S, "Midnight");
+
+    // 3. equaliser with the Bass Boost preset
+    S.view = "eq";
+    let preset = [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    for (i in 0..10) { S.E.eq[i] = preset[i]; }
+    S.E.bass = 3.0; S.E.reverb = 0.12;
+    step(S, 20, 0.03);
+    shot(S, out, "equalizer");
+    for (i in 0..10) { S.E.eq[i] = 0.0; }
+    S.E.bass = 0.0; S.E.reverb = 0.0;
+
+    // 4. score / piano roll
+    S.view = "score";
+    step(S, 20, 0.03);
+    shot(S, out, "score");
+
+    // 5. queue, playlists, settings
+    S.view = "queue"; step(S, 4, 0.0); shot(S, out, "queue");
+    S.view = "playlists"; S.pl_sel = idx; step(S, 4, 0.0); shot(S, out, "playlists");
+    S.view = "settings"; step(S, 4, 0.0); shot(S, out, "settings");
+
+    // 6. studio: sequencer + piano roll, rendered and playing
+    studio.apply_template(S, "House");
+    S.view = "studio"; S.st.sel = 0; S.st.fit_sel = -1;
+    step(S, 3, 0.0);
+    views3.do_render(S);
+    wait_ready(S);
+    step(S, 25, 0.03);
+    shot(S, out, "studio-sequencer");
+    S.st.sel = 2; S.st.fit_sel = -1;
+    step(S, 6, 0.03);
+    shot(S, out, "studio-pianoroll");
+
+    // 7. themes
+    S.view = "library";
+    for (th in ["Neon", "Sunset", "Forest", "Paper"]) {
+        core.set_theme(S, th);
+        step(S, 6, 0.03);
+        shot(S, out, "theme-" + th);
+    }
+    core.shutdown(S);
+}

@@ -1,0 +1,406 @@
+// views3.kc — the Studio screen: step sequencer, piano-roll editor, mixer, project/export controls.
+import std.game;
+import std.music_note;
+import std.system;
+import "ui.kc" as ui;
+import "core.kc" as core;
+import "engine.kc" as engine;
+import "library.kc" as lib;
+import "studio.kc" as studio;
+
+const CW = 19;          // cell width in pixels
+const PAGE = 32;        // steps per page
+const KEYW = 56;        // key / lane label strip
+
+fn play_studio(S, t) { core.play_ctx(S, t, [t]); }
+
+fn do_render(S) {
+    let st = S.st;
+    if (studio.render_play(S, play_studio)) {
+        if (st.loop) { S.settings.repeat = 2; }
+    }
+}
+
+fn handle_menus3(S) {
+    let U = S.U;
+    let st = S.st;
+    var c = ui.take_choice(U, "st_tpl");
+    if (c != null) { studio.apply_template(S, c.label); ui.toast(U, "Template: " + c.label); }
+    c = ui.take_choice(U, "st_master");
+    if (c != null) { st.P.master = c.label; st.dirty = true; }
+    c = ui.take_choice(U, "st_scale");
+    if (c != null) { st.scale = c.label; }
+    c = ui.take_choice(U, "st_root");
+    if (c != null) { st.root = c.index; }
+    c = ui.take_choice(U, "st_inst");
+    if (c != null) {
+        let tr = st.P.tracks[st.sel];
+        tr.inst = c.label;
+        tr.sample = "";
+        st.dirty = true;
+        studio.preview(S, c.label, 60);
+    }
+    c = ui.take_choice(U, "st_open");
+    if (c != null) {
+        if (studio.open_project(S, c.label)) { ui.toast(U, "Opened " + c.label); } else { ui.toast(U, "Could not open project"); }
+    }
+    let tr = st.P.tracks[min(st.sel, len(st.P.tracks) - 1)];
+    c = ui.take_choice(U, "st_edit");
+    if (c != null) {
+        if (c.label == "Double length") { if (!studio.double_length(S)) { ui.toast(U, "Already 8 bars"); } }
+        else if (c.label == "Shift left") { studio.shift_track(S, tr, -1); }
+        else if (c.label == "Shift right") { studio.shift_track(S, tr, 1); }
+        else if (c.label == "Transpose +1") { studio.transpose_track(S, tr, 1); }
+        else if (c.label == "Transpose -1") { studio.transpose_track(S, tr, -1); }
+        else if (c.label == "Octave up") { studio.transpose_track(S, tr, 12); }
+        else if (c.label == "Octave down") { studio.transpose_track(S, tr, -12); }
+        else if (c.label == "Reverse") { studio.reverse_track(S, tr); }
+        else if (c.label == "Humanize velocity") { studio.humanize_track(S, tr); }
+        st.dirty = true;
+    }
+    c = ui.take_choice(U, "st_gen");
+    if (c != null) {
+        if (c.label == "Random") { studio.randomize(S); } else { studio.generate(S, c.label); }
+    }
+}
+
+fn inst_choices() -> any { return ["piano", "epiano", "organ", "bell", "pluck", "bass", "808", "slap", "clav", "wah", "stab", "strings", "pad", "brass", "flute", "lead", "saw", "marimba", "harp", "choir"]; }
+
+fn slider_row(U, id, x, y, w, label, value, lo, hi, fmt) -> any {
+    ui.text(x, y - 4, label, U.T.dim, 1);
+    ui.text_r(x + w, y - 4, fmt, U.T.dim, 1);
+    return ui.slider(U, id, x, y + 18, w, value, lo, hi);
+}
+
+fn view_studio(S, x, y, w, h) {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    let st = S.st;
+    let P = st.P;
+    studio.tick_preview(S);
+    handle_menus3(S);
+    var changed = false;
+    // ---------------- row 1: transport / project ----------------
+    let lbl = st.dirty ? "Render & Play *" : "Render & Play";
+    if (ui.button(U, "st/render", x + 12, y + 6, 150, 30, lbl, "primary")) { do_render(S); }
+    if (ui.button(U, "st/stop", x + 168, y + 6, 60, 30, "Stop", "ghost")) { engine.stop(E); }
+    if (ui.chip(U, "st/loop", x + 236, y + 9, "Loop", st.loop)) { st.loop = !st.loop; S.settings.repeat = st.loop ? 2 : 0; }
+    if (ui.chip(U, "st/live", x + 296, y + 9, "Live", st.live)) { st.live = !st.live; ui.toast(U, st.live ? "Live: re-renders while playing" : "Live off"); }
+    ui.tooltip(U, x + 296, y + 9, ui.chip_w("Live"), 24, "Auto re-render when you edit during playback");
+    if (ui.button(U, "st/undo", x + 358, y + 6, 66, 30, "Undo", "ghost")) { if (!studio.undo(S)) { ui.toast(U, "Nothing to undo"); } }
+    if (ui.button(U, "st/rand", x + 430, y + 6, 100, 30, "Generate", "ghost")) {
+        ui.menu_open(U, x + 430, y + 38, ["Random", "Arp up", "Arp up/down", "Chords", "Bassline", "Drum fill"], "st_gen");
+    }
+    if (ui.button(U, "st/tpl", x + 536, y + 6, 110, 30, "Templates", "ghost")) { ui.menu_open(U, x + 536, y + 38, ["House", "Trap", "Funk", "Lo-fi", "Basic"], "st_tpl"); }
+    if (ui.button(U, "st/save", x + 652, y + 6, 66, 30, "Save", "ghost")) {
+        let p = studio.save_project(S);
+        ui.toast(U, p != null ? "Saved " + p : "Save failed");
+    }
+    if (ui.button(U, "st/open", x + 724, y + 6, 66, 30, "Open", "ghost")) {
+        let l = studio.project_list(S);
+        if (len(l) == 0) { ui.toast(U, "No saved projects yet"); } else { ui.menu_open(U, x + 724, y + 38, l, "st_open"); }
+    }
+    if (ui.button(U, "st/new", x + 796, y + 6, 60, 30, "New", "ghost")) { studio.snapshot(S); st.P = studio.blank("Untitled", 120); st.sel = 0; }
+    let nm = ui.text_input(U, "st/name", x + w - 180, y + 6, 168, 30, P.name, "Project name");
+    if (nm != P.name) { P.name = nm; }
+    // ---------------- row 2: tempo / swing / bars / master / humanize / duck ----------------
+    ui.text(x + 12, y + 56, "BPM", T.dim, 1);
+    let bv = ui.slider(U, "st/bpm", x + 46, y + 60, 120, P.bpm * 1.0, 60.0, 200.0);
+    if (U.changed && U.active == "st/bpm") { P.bpm = int(bv); changed = true; }
+    ui.text(x + 178, y + 56, "" + P.bpm, T.text, 1);
+    ui.text(x + 214, y + 56, "Swing", T.dim, 1);
+    let sv = ui.slider(U, "st/swing", x + 262, y + 60, 84, P.swing, 0.0, 0.5);
+    if (U.changed && U.active == "st/swing") { P.swing = sv; changed = true; }
+    ui.text(x + 366, y + 56, "Bars", T.dim, 1);
+    let bars = [1, 2, 4, 8];
+    var bsel = 2;
+    for (i in 0..4) { if (bars[i] == P.bars) { bsel = i; } }
+    let nb = ui.segmented(U, "st/bars", x + 404, y + 48, 130, 26, ["1", "2", "4", "8"], bsel);
+    if (bars[nb] != P.bars) { P.bars = bars[nb]; st.page = 0; changed = true; }
+    ui.text(x + 548, y + 56, "Master", T.dim, 1);
+    if (ui.button(U, "st/master", x + 604, y + 48, 76, 26, P.master, "ghost")) { ui.menu_open(U, x + 604, y + 76, studio.masters(), "st_master"); }
+    ui.text(x + 696, y + 56, "Human", T.dim, 1);
+    let hv = ui.slider(U, "st/human", x + 748, y + 60, 70, P.humanize, 0.0, 30.0);
+    if (U.changed && U.active == "st/human") { P.humanize = hv; changed = true; }
+    ui.tooltip(U, x + 696, y + 50, 130, 22, "Random timing wobble in ms: " + int(P.humanize));
+    ui.text(x + 836, y + 56, "Duck", T.dim, 1);
+    let dv = ui.slider(U, "st/duck", x + 876, y + 60, 70, P.duck_depth, 0.0, 1.0);
+    if (U.changed && U.active == "st/duck") { P.duck_depth = dv; changed = true; }
+    ui.tooltip(U, x + 836, y + 50, 120, 22, "Sidechain depth: tracks marked Duck are ducked by the kick");
+    // ---------------- tracks column ----------------
+    let tx = x + 12;
+    var ty = y + 90;
+    for (i in 0..len(P.tracks)) {
+        let tr = P.tracks[i];
+        let sel = st.sel == i;
+        let id = "st/t" + i;
+        if (ui.press(U, id, tx, ty, 170, 34)) { st.sel = i; }
+        ui.rrect_border(U.T.panel == 0 ? tx : tx, ty, 170, 34, 8, sel ? game.mix(T.panel, T.accent, 0.25) : (U.hot == id ? T.panel2 : T.panel), 1, sel ? T.accent : T.line);
+        ui.icon(tr.kind == "drum" ? "disc" : "note", tx + 16, ty + 17, 14, sel ? T.accent : T.dim);
+        ui.text_fit(tx + 32, ty + 7, 80, tr.name, tr.mute ? T.dim : T.text, 1);
+        ui.text_fit(tx + 32, ty + 19, 80, tr.kind == "drum" ? "drum kit" : (tr.sample != "" ? "sample" : tr.inst), T.dim, 1);
+        if (ui.press(U, id + "m", tx + 116, ty + 6, 22, 22)) { tr.mute = !tr.mute; changed = true; }
+        ui.rrect(tx + 116, ty + 6, 22, 22, 5, tr.mute ? T.bad : T.panel2);
+        ui.text(tx + 123, ty + 13, "M", tr.mute ? 0xffffff : T.dim, 1);
+        if (ui.press(U, id + "s", tx + 142, ty + 6, 22, 22)) { tr.solo = !tr.solo; changed = true; }
+        ui.rrect(tx + 142, ty + 6, 22, 22, 5, tr.solo ? T.warn : T.panel2);
+        ui.text(tx + 149, ty + 13, "S", tr.solo ? 0x101010 : T.dim, 1);
+        ty += 38;
+    }
+    if (ui.button(U, "st/adrum", tx, ty + 2, 83, 26, "+ Drums", "ghost")) { studio.add_track(S, "drum"); }
+    if (ui.button(U, "st/asyn", tx + 87, ty + 2, 83, 26, "+ Synth", "ghost")) { studio.add_track(S, "note"); }
+    if (ui.button(U, "st/del", tx, ty + 32, 83, 26, "Delete", "ghost")) { studio.remove_track(S, st.sel); }
+    if (ui.button(U, "st/clr", tx + 87, ty + 32, 83, 26, "Clear", "ghost")) { studio.clear_track(S, P.tracks[st.sel]); }
+    if (ui.button(U, "st/edit", tx, ty + 62, 170, 26, "Edit track...", "ghost")) {
+        ui.menu_open(U, tx + 20, ty + 64, ["Double length", "-", "Shift left", "Shift right", "Transpose +1", "Transpose -1", "Octave up", "Octave down", "-", "Reverse", "Humanize velocity"], "st_edit");
+    }
+    // ---------------- grid ----------------
+    let tr = P.tracks[min(st.sel, len(P.tracks) - 1)];
+    let gx = x + 12 + 170 + 10 + KEYW;
+    let gy = y + 90;
+    let total = P.bars * 16;
+    let pages = max(1, idiv(total + PAGE - 1, PAGE));
+    if (st.page >= pages) { st.page = pages - 1; }
+    if (st.fit_sel != st.sel && tr.kind == "note" && len(tr.notes) > 0) {
+        var lowm = 127;
+        for (nt in tr.notes) { if (nt.m < lowm) { lowm = nt.m; } }
+        st.oct = clamp(idiv(lowm, 12) - 1, 0, 6);
+    }
+    st.fit_sel = st.sel;
+    let s0 = st.page * PAGE;
+    let cols = min(PAGE, total - s0);
+    let rows = tr.kind == "drum" ? len(tr.lanes) : 24;
+    let rh = tr.kind == "drum" ? 40 : 15;
+    let gw = cols * CW;
+    let gh = rows * rh;
+    ui.rrect(gx - KEYW - 4, gy - 4, KEYW + gw + 8, gh + 8, 8, T.panel);
+    var play_step = -1;
+    if (E.track != null && E.track.id == "studio:project" && E.state == "playing") {
+        play_step = int(E.pos_cache * P.bpm / 15.0) % total;
+    }
+    let lo = 12 * (st.oct + 1);
+    let over = ui.hit(U, gx, gy, gw, gh);
+    var cell_c = -1;
+    var cell_r = -1;
+    if (over) { cell_c = int((U.mx - gx) / CW); cell_r = int((U.my - gy) / rh); }
+    if (tr.kind == "drum") {
+        for (r in 0..rows) {
+            let lane = tr.lanes[r];
+            let ry = gy + r * rh;
+            ui.text(gx - KEYW + 2, ry + 16, lane.d, T.dim, 1);
+            for (c in 0..cols) {
+                let step = s0 + c;
+                let lv = lane.s[step];
+                let beat = (c % 4) < 2;
+                var col = beat ? T.panel2 : game.mix(T.panel2, T.bg, 0.4);
+                var inset = 2;
+                if (lv != 0) {
+                    col = game.mix(T.accent, T.accent2, r / 8.0);
+                    if (lv == 2) { col = game.mix(col, 0xffffff, 0.35); inset = 0; }
+                    if (lv == 3) { col = game.mix(col, T.panel2, 0.6); inset = 8; }
+                }
+                if (step == play_step) { col = game.mix(col, 0xffffff, 0.35); }
+                ui.rrect(gx + c * CW, ry + inset, CW - 2, rh - 2 * inset, 3, col);
+            }
+        }
+        if (over && cell_r < rows) {
+            let l = tr.lanes[cell_r];
+            if (U.pressed) { studio.snapshot(S); st.paint = l.s[s0 + cell_c] == 0 ? 1 : 0; }
+            if (U.down && st.paint >= 0) {
+                let cur = l.s[s0 + cell_c];
+                if ((st.paint == 0 && cur != 0) || (st.paint == 1 && cur == 0)) { l.s[s0 + cell_c] = st.paint; st.dirty = true; }
+            }
+            if (U.rpressed && l.s[s0 + cell_c] != 0) {
+                studio.snapshot(S);
+                l.s[s0 + cell_c] = l.s[s0 + cell_c] % 3 + 1;
+                st.dirty = true;
+            }
+        }
+        if (!U.down) { st.paint = -1; }
+    } else {
+        for (r in 0..rows) {
+            let m = lo + 23 - r;
+            let ry = gy + r * rh;
+            let black = (m % 12 == 1 || m % 12 == 3 || m % 12 == 6 || m % 12 == 8 || m % 12 == 10);
+            var rc = studio.in_scale(S, m) ? T.panel2 : game.mix(T.panel2, T.bg, 0.5);
+            if (m % 12 == st.root) { rc = game.mix(rc, T.accent, 0.18); }
+            game.rect(gx, ry, gw, rh - 1, rc);
+            if (ui.press(U, "st/key" + r, gx - KEYW, ry, KEYW - 4, rh)) { studio.preview(S, tr.inst, m); }
+            game.rect(gx - KEYW, ry, KEYW - 4, rh - 1, black ? 0x26262c : 0xdcdce2);
+            if (m % 12 == 0) { ui.text(gx - KEYW + 4, ry + 4, "C" + (idiv(m, 12) - 1), 0x202028, 1); }
+        }
+        for (c in 0..cols) {
+            if (c % 4 == 0) { game.rect(gx + c * CW, gy, 1, gh, T.line); }
+            if (s0 + c == play_step) { game.rect(gx + c * CW, gy, CW, gh, 0x30ffffff); }
+        }
+        for (nt in tr.notes) {
+            if (nt.m >= lo && nt.m < lo + 24 && nt.t + nt.l > s0 && nt.t < s0 + cols) {
+                let a = max(nt.t, s0);
+                let b = min(nt.t + nt.l, s0 + cols);
+                let nx = gx + (a - s0) * CW + 1;
+                let ny = gy + (lo + 23 - nt.m) * rh + 1;
+                var nc = game.mix(T.panel2, T.accent, 0.4 + 0.6 * clamp(nt.v / 127.0, 0.0, 1.0));
+                if (nt.s) { nc = game.mix(nc, T.accent2, 0.6); }
+                ui.rrect(nx, ny, (b - a) * CW - 2, rh - 2, 3, nc);
+                if (b == nt.t + nt.l) { game.rect(nx + (b - a) * CW - 5, ny + 2, 2, rh - 6, game.mix(nc, 0xffffff, 0.5)); }
+            }
+        }
+        // ---- note interaction: click empty = add, drag = move / resize, click = remove, wheel = velocity
+        let d = st.drag;
+        if (d == null) {
+            if (over && U.pressed) {
+                let step = s0 + cell_c;
+                let m = lo + 23 - cell_r;
+                let i = studio.find_note(tr, step, m);
+                studio.snapshot(S);
+                if (i >= 0) {
+                    let nt = tr.notes[i];
+                    let edge = step == nt.t + nt.l - 1 && nt.l > 1 && (U.mx - gx) % CW > CW / 2;
+                    st.drag = { i: i, mode: edge ? 1 : 0, ox: step - nt.t, moved: false };
+                } else {
+                    studio.toggle_note(S, tr, step, m);
+                    studio.preview(S, tr.inst, m);
+                }
+            }
+            if (over && U.rpressed) {
+                let i = studio.find_note(tr, s0 + cell_c, lo + 23 - cell_r);
+                if (i >= 0) { studio.snapshot(S); tr.notes = lib.array_remove_at(tr.notes, i); st.dirty = true; }
+            }
+            if (over && U.wheel != 0) {
+                let i = studio.find_note(tr, s0 + cell_c, lo + 23 - cell_r);
+                if (i >= 0) { tr.notes[i].v = clamp(tr.notes[i].v + U.wheel * 8, 20, 127); st.dirty = true; }
+            }
+        } else {
+            let nt = tr.notes[d.i];
+            let c = clamp(int((U.mx - gx) / CW), 0, cols - 1);
+            let r = clamp(int((U.my - gy) / rh), 0, 23);
+            if (U.down) {
+                if (d.mode == 1) {
+                    let nl = max(1, s0 + c - nt.t + 1);
+                    if (nl != nt.l) { nt.l = nl; d.moved = true; st.dirty = true; }
+                } else {
+                    let nt_t = clamp(s0 + c - d.ox, 0, total - nt.l);
+                    let nm = lo + 23 - r;
+                    if (nt_t != nt.t || nm != nt.m) {
+                        if (nm != nt.m) { studio.preview(S, tr.inst, nm); }
+                        nt.t = nt_t; nt.m = nm; d.moved = true; st.dirty = true;
+                    }
+                }
+            } else {
+                if (!d.moved) { tr.notes = lib.array_remove_at(tr.notes, d.i); st.dirty = true; }
+                st.drag = null;
+            }
+        }
+    }
+    for (c in 0..cols) { if (c % 4 == 0) { ui.text(gx + c * CW + 2, gy + gh + 8, "" + (idiv(s0 + c, 4) + 1), T.dim, 1); } }
+    if (over && cell_c >= 0) { game.rect(gx + cell_c * CW, gy, CW - 1, gh, 0x14ffffff); }
+    var px = gx;
+    for (p in 0..pages) {
+        let lab = "Bars " + (p * 2 + 1) + "-" + min(P.bars, p * 2 + 2);
+        if (pages > 1 && ui.chip(U, "st/pg" + p, px, gy + gh + 24, lab, st.page == p)) { st.page = p; }
+        px += ui.chip_w(lab) + 6;
+    }
+    // ---------------- right panel: selected track ----------------
+    let rx = x + w - 190;
+    ui.panel(U, rx, gy - 4, 178, 392, 10);
+    st.ptab = ui.segmented(U, "st/ptab", rx + 10, gy + 4, 158, 24, ["Mix", "Note"], st.ptab);
+    var ry = gy + 44;
+    if (st.ptab == 0) {
+        let tn = ui.text_input(U, "st/trname", rx + 12, ry - 8, 154, 26, tr.name, "Track name");
+        if (tn != tr.name) { tr.name = tn; }
+        ry += 28;
+        if (tr.kind == "note") {
+            if (ui.button(U, "st/inst", rx + 12, ry - 6, 154, 24, tr.sample != "" ? "Sample" : "Instr: " + tr.inst, "ghost")) { ui.menu_open(U, rx - 40, ry + 20, inst_choices(), "st_inst"); }
+        } else { ui.text(rx + 14, ry + 2, "8-lane drum kit", T.dim, 1); }
+        ry += 38;
+        var v = slider_row(U, "st/vol", rx + 14, ry, 148, "Volume", tr.vol, 0.0, 1.5, sprintf("%.2f", tr.vol));
+        if (v != tr.vol) { tr.vol = v; changed = true; }
+        ry += 44;
+        v = slider_row(U, "st/pan", rx + 14, ry, 148, "Pan", tr.pan, -1.0, 1.0, sprintf("%+.2f", tr.pan));
+        if (v != tr.pan) { tr.pan = v; changed = true; }
+        ry += 44;
+        v = slider_row(U, "st/rev", rx + 14, ry, 148, "Reverb", tr.rev, 0.0, 1.0, sprintf("%d%%", int(tr.rev * 100)));
+        if (v != tr.rev) { tr.rev = v; changed = true; }
+        ry += 44;
+        if (tr.kind == "note") {
+            v = slider_row(U, "st/glide", rx + 14, ry, 148, "808 glide", tr.glide, 0.0, 0.3, sprintf("%.2fs", tr.glide));
+            if (v != tr.glide) { tr.glide = v; changed = true; }
+            ry += 46;
+            ui.text(rx + 14, ry + 4, "Duck (sidechain)", T.dim, 1);
+            if (ui.toggle(U, "st/dk", rx + 124, ry - 2, tr.duck)) { tr.duck = !tr.duck; changed = true; }
+        }
+    } else {
+        if (tr.kind == "drum") {
+            ui.text(rx + 14, ry, "Drum steps:", T.text, 1);
+            ui.text(rx + 14, ry + 18, "click = on/off", T.dim, 1);
+            ui.text(rx + 14, ry + 32, "drag = paint", T.dim, 1);
+            ui.text(rx + 14, ry + 46, "right-click = cycle", T.dim, 1);
+            ui.text(rx + 14, ry + 60, "normal/accent/ghost", T.dim, 1);
+        } else {
+            let vv = slider_row(U, "st/vel", rx + 14, ry - 6, 148, "Velocity", st.vel * 1.0, 20.0, 127.0, "" + st.vel);
+            st.vel = int(vv);
+            ry += 42;
+            ui.text(rx + 14, ry - 4, "Length", T.dim, 1);
+            let lens = [1, 2, 4, 8];
+            let ln = ["1/16", "1/8", "1/4", "1/2"];
+            var cx = rx + 12;
+            for (i in 0..4) {
+                if (ui.chip(U, "st/len" + i, cx, ry + 8, ln[i], st.len == lens[i])) { st.len = lens[i]; }
+                cx += ui.chip_w(ln[i]) - 2;
+            }
+            ry += 42;
+            ui.text(rx + 14, ry - 4, "Chord stamp", T.dim, 1);
+            if (ui.button(U, "st/chord", rx + 12, ry + 10, 154, 24, studio.chords()[st.chord], "ghost")) { st.chord = (st.chord + 1) % 5; }
+            ry += 44;
+            ui.text(rx + 14, ry - 4, "Slide new notes", T.dim, 1);
+            if (ui.toggle(U, "st/slide", rx + 124, ry + 10, st.slide)) { st.slide = !st.slide; }
+            ry += 38;
+            if (ui.button(U, "st/oct-", rx + 12, ry, 36, 24, "-", "ghost")) { st.oct = max(0, st.oct - 1); }
+            if (ui.button(U, "st/oct+", rx + 52, ry, 36, 24, "+", "ghost")) { st.oct = min(6, st.oct + 1); }
+            if (ui.button(U, "st/scale", rx + 92, ry, 74, 24, st.scale, "ghost")) { ui.menu_open(U, rx - 20, ry + 26, studio.scales(), "st_scale"); }
+            ry += 30;
+            if (ui.button(U, "st/root", rx + 12, ry, 154, 24, "Key: " + studio.NOTE_NAMES[st.root], "ghost")) { ui.menu_open(U, rx - 20, ry + 26, studio.NOTE_NAMES, "st_root"); }
+        }
+    }
+    // sample loader strip (Mix tab, synth tracks)
+    if (st.ptab == 0 && tr.kind == "note") {
+        let sy = gy + 4 + 392 - 44;
+        if (tr.sample != "") {
+            ui.text_fit(rx + 12, sy + 2, 120, system.basename(tr.sample), T.accent2, 1);
+            if (ui.icon_button(U, "st/smpx", rx + 140, sy - 4, 24, "close", false, "Remove sample")) { studio.clear_sample(S, tr); }
+        } else {
+            let sp = ui.text_input(U, "st/sample", rx + 12, sy - 4, 126, 24, st.sample_in, "sample .wav path");
+            st.sample_in = sp;
+            if (ui.icon_button(U, "st/smpl", rx + 142, sy - 4, 24, "folder", true, "Load sample") || U.submit == "st/sample") {
+                let msg = studio.set_sample(S, tr, st.sample_in);
+                if (msg == "") { ui.toast(U, "Sample loaded: play it from the piano roll"); st.sample_in = ""; } else { ui.toast(U, msg); }
+            }
+        }
+    }
+    // ---------------- export ----------------
+    let ey = y + h - 38;
+    ui.text(x + 12, ey + 10, "Export", T.dim, 1);
+    if (ui.button(U, "st/ewav", x + 70, ey, 66, 28, "WAV", "ghost")) {
+        try { ui.toast(U, "Saved " + studio.export_wav(S)); } catch (e) { ui.toast(U, "Export failed: " + e.message); }
+    }
+    if (ui.button(U, "st/emid", x + 142, ey, 66, 28, "MIDI", "ghost")) {
+        try { ui.toast(U, "Saved " + studio.export_midi(S)); } catch (e) { ui.toast(U, "Export failed: " + e.message); }
+    }
+    if (ui.button(U, "st/estem", x + 214, ey, 76, 28, "Stems", "ghost")) {
+        try { ui.toast(U, "Stems in " + studio.export_stems(S)); } catch (e) { ui.toast(U, "Export failed: " + e.message); }
+    }
+    if (ui.button(U, "st/ekcm", x + 296, ey, 200, 28, "Add to Library (.kcm)", "ghost")) {
+        try { ui.toast(U, "Added " + studio.export_kcm(S)); } catch (e) { ui.toast(U, "Export failed: " + e.message); }
+    }
+    ui.text(x + 510, ey + 10, "wheel on a note = velocity - drag edge = resize", T.dim, 1);
+    // ---------------- bookkeeping ----------------
+    if (changed) { st.dirty = true; }
+    if (st.dirty && (!st.prev_dirty || U.down)) { st.edit_t = U.t; }
+    st.prev_dirty = st.dirty;
+    if (st.live && st.dirty && E.state == "playing" && E.track != null && E.track.id == "studio:project" && !U.down && U.t - st.edit_t > 0.7) {
+        let p = E.pos_cache;
+        do_render(S);
+        if (E.raw != null) { engine.seek(E, min(p, E.dur - 0.2)); }
+    }
+}

@@ -1,0 +1,762 @@
+// studio.kc — the music production engine: project model, pattern generators, notation compiler,
+// renderer, undo, save/load, export. A project is plain data (JSON-friendly); it is compiled to the
+// music_note notation language, rendered with the synth/drum engine, mastered, and handed to the player.
+import std.music_note;
+import std.system;
+import std.json;
+import std.io;
+import "library.kc" as lib;
+import "engine.kc" as engine;
+import "ui.kc" as ui;
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const DRUM_LANES = ["kick", "snare", "clap", "hat", "ohat", "rim", "tom_lo", "crash"];
+
+fn note_name(m) -> any { return NOTE_NAMES[m % 12] + (idiv(m, 12) - 1); }
+
+fn scales() -> any { return ["Chromatic", "Major", "Minor", "Pentatonic", "Blues", "Dorian"]; }
+
+fn scale_steps(name) -> any {
+    if (name == "Major") { return [0, 2, 4, 5, 7, 9, 11]; }
+    if (name == "Minor") { return [0, 2, 3, 5, 7, 8, 10]; }
+    if (name == "Pentatonic") { return [0, 2, 4, 7, 9]; }
+    if (name == "Blues") { return [0, 3, 5, 6, 7, 10]; }
+    if (name == "Dorian") { return [0, 2, 3, 5, 7, 9, 10]; }
+    return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+}
+
+fn in_scale(S, m) -> any {
+    let st = scale_steps(S.st.scale);
+    return ((m - S.st.root) % 12 + 12) % 12 in st;
+}
+
+fn masters() -> any { return ["clean", "phonk", "funk", "loud", "lofi", "tape", "none"]; }
+
+fn new_state() -> any {
+    return { P: blank("Untitled", 120), sel: 0, page: 0, oct: 3, len: 2, undo: [], paint: -1, scale: "Minor", root: 9,
+             vel: 100, slide: false, chord: 0, drag: null, ptab: 0, sample_in: "",
+             name_in: "", rev: 0, track: null, loop: false, preview: null, msg: "", last_text: "", rendered_rev: -1, dirty: true, live: false, edit_t: 0.0, prev_dirty: false, name_edit: "", fit_sel: -1 };
+}
+
+fn drum_track(name) -> any {
+    var lanes = [];
+    for (d in DRUM_LANES) { push(lanes, { d: d, s: zeros(128) }); }
+    return { name: name, kind: "drum", inst: "drums", vol: 0.9, pan: 0.0, rev: 0.05, mute: false, solo: false, lanes: lanes, notes: [], duck: false, glide: 0.0, sample: "" };
+}
+
+fn synth_track(name, inst, vol) -> any {
+    return { name: name, kind: "note", inst: inst, vol: vol, pan: 0.0, rev: 0.15, mute: false, solo: false, lanes: [], notes: [], duck: false, glide: 0.0, sample: "" };
+}
+
+fn zeros(n) -> any {
+    var a = [];
+    for (i in 0..n) { push(a, 0); }
+    return a;
+}
+
+fn blank(name, bpm) -> any {
+    return { name: name, bpm: bpm, swing: 0.0, bars: 4, master: "clean", humanize: 0.0, duck_depth: 0.6, tracks: [drum_track("Drums"), synth_track("Bass", "bass", 0.85), synth_track("Lead", "pluck", 0.7)] };
+}
+
+fn steps_total(P) -> any { return P.bars * 16; }
+
+// fill fields that older saved projects do not have
+fn migrate(P) -> any {
+    if (!("humanize" in P)) { P["humanize"] = 0.0; }
+    if (!("duck_depth" in P)) { P["duck_depth"] = 0.6; }
+    for (tr in P.tracks) {
+        if (!("duck" in tr)) { tr["duck"] = false; }
+        if (!("glide" in tr)) { tr["glide"] = 0.0; }
+        if (!("sample" in tr)) { tr["sample"] = ""; }
+        for (nt in tr.notes) {
+            if (!("v" in nt)) { nt["v"] = 100; }
+            if (!("s" in nt)) { nt["s"] = false; }
+        }
+    }
+    return P;
+}
+
+// ---------------------------------------------------------------------------------------------
+// undo
+// ---------------------------------------------------------------------------------------------
+fn snapshot(S) {
+    let st = S.st;
+    push(st.undo, json.stringify(st.P));
+    if (len(st.undo) > 40) { st.undo = st.undo[len(st.undo) - 40..len(st.undo)]; }
+    st.dirty = true;
+}
+
+fn undo(S) -> any {
+    let st = S.st;
+    if (len(st.undo) == 0) { return false; }
+    st.P = migrate(json.parse(st.undo[len(st.undo) - 1]));
+    st.undo = st.undo[0..len(st.undo) - 1];
+    if (st.sel >= len(st.P.tracks)) { st.sel = len(st.P.tracks) - 1; }
+    st.dirty = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// editing
+// ---------------------------------------------------------------------------------------------
+fn find_note(tr, t, m) -> any {
+    for (i in 0..len(tr.notes)) {
+        let n = tr.notes[i];
+        if (n.m == m && t >= n.t && t < n.t + n.l) { return i; }
+    }
+    return -1;
+}
+
+fn toggle_note(S, tr, t, m) {
+    let i = find_note(tr, t, m);
+    if (i >= 0) { tr.notes = lib.array_remove_at(tr.notes, i); }
+    else { add_note(S, tr, t, m); }
+    S.st.dirty = true;
+}
+
+fn add_note(S, tr, t, m) {
+    let st = S.st;
+    if (st.chord > 0) {
+        for (k in chord_offsets(S, m, st.chord)) { push(tr.notes, { t: t, l: st.len, m: k, v: st.vel, s: false }); }
+    } else {
+        push(tr.notes, { t: t, l: st.len, m: m, v: st.vel, s: st.slide });
+    }
+}
+
+fn chords() -> any { return ["Off", "Triad", "7th", "Power", "Sus4"]; }
+
+// midi notes of a chord built on `m`, following the current scale
+fn chord_offsets(S, m, kind) -> any {
+    let sc = scale_steps(S.st.scale);
+    var pool = [];
+    for (o in 0..4) { for (d in sc) { push(pool, S.st.root + 12 * (idiv(m, 12) - 1 + o) + d); } }
+    var idx = -1;
+    for (i in 0..len(pool)) { if (pool[i] == m) { idx = i; } }
+    if (kind == 3) { return [m, m + 7, m + 12]; }
+    if (idx < 0 || idx + 6 >= len(pool) || len(sc) < 7) {
+        if (kind == 2) { return [m, m + 4, m + 7, m + 11]; }
+        if (kind == 4) { return [m, m + 5, m + 7]; }
+        return [m, m + 4, m + 7];
+    }
+    if (kind == 2) { return [pool[idx], pool[idx + 2], pool[idx + 4], pool[idx + 6]]; }
+    if (kind == 4) { return [pool[idx], pool[idx + 3], pool[idx + 4]]; }
+    return [pool[idx], pool[idx + 2], pool[idx + 4]];
+}
+
+fn add_track(S, kind) -> any {
+    let P = S.st.P;
+    if (len(P.tracks) >= 8) { ui.toast(S.U, "Max 8 tracks"); return 0; }
+    snapshot(S);
+    if (kind == "drum") { push(P.tracks, drum_track("Drums " + (len(P.tracks) + 1))); }
+    else { push(P.tracks, synth_track("Synth " + (len(P.tracks) + 1), "lead", 0.7)); }
+    S.st.sel = len(P.tracks) - 1;
+}
+
+fn remove_track(S, i) -> any {
+    let P = S.st.P;
+    if (len(P.tracks) <= 1) { return 0; }
+    snapshot(S);
+    P.tracks = lib.array_remove_at(P.tracks, i);
+    if (S.st.sel >= len(P.tracks)) { S.st.sel = len(P.tracks) - 1; }
+}
+
+fn clear_track(S, tr) {
+    snapshot(S);
+    tr.notes = [];
+    for (l in tr.lanes) { l.s = zeros(128); }
+}
+
+fn euclid(lane, hits, n, rot) -> any {
+    // Bjorklund-style even spread of `hits` over n steps
+    for (i in 0..n) { lane[i] = 0; }
+    if (hits <= 0) { return 0; }
+    for (k in 0..hits) { lane[(idiv(k * n, hits) + rot) % n] = 1; }
+}
+
+// ---------------------------------------------------------------------------------------------
+// style templates and random pattern generators
+// ---------------------------------------------------------------------------------------------
+fn lane_of(tr, d) -> any {
+    for (l in tr.lanes) { if (l.d == d) { return l; } }
+    return null;
+}
+
+fn fill_drums(tr, style, bars) {
+    let n = bars * 16;
+    for (l in tr.lanes) { l.s = zeros(128); }
+    let kick = lane_of(tr, "kick");
+    let snare = lane_of(tr, "snare");
+    let clap = lane_of(tr, "clap");
+    let hat = lane_of(tr, "hat");
+    let ohat = lane_of(tr, "ohat");
+    let rim = lane_of(tr, "rim");
+    for (b in 0..bars) {
+        let o = b * 16;
+        if (style == "House") {
+            for (k in 0..4) { kick.s[o + k * 4] = 1; ohat.s[o + k * 4 + 2] = 1; }
+            clap.s[o + 4] = 1; clap.s[o + 12] = 1;
+            for (k in 0..8) { hat.s[o + k * 2 + 1] = 1; }
+        } else if (style == "Trap") {
+            kick.s[o] = 1; kick.s[o + 7] = 1; kick.s[o + 10] = 1; if (b % 2 == 1) { kick.s[o + 13] = 1; }
+            snare.s[o + 8] = 1; clap.s[o + 8] = 1;
+            for (k in 0..16) { hat.s[o + k] = k % 2 == 0 ? 1 : 0; }
+            if (b % 4 == 3) { for (k in 12..16) { hat.s[o + k] = 1; } }
+            ohat.s[o + 14] = 1;
+        } else if (style == "Funk") {
+            kick.s[o] = 1; kick.s[o + 3] = 1; kick.s[o + 6] = 1; kick.s[o + 10] = 1; kick.s[o + 11] = 1;
+            snare.s[o + 4] = 1; snare.s[o + 12] = 1; rim.s[o + 7] = 1; rim.s[o + 15] = 1;
+            for (k in 0..16) { hat.s[o + k] = 1; }
+        } else if (style == "Lo-fi") {
+            kick.s[o] = 1; kick.s[o + 9] = 1; snare.s[o + 4] = 1; snare.s[o + 12] = 1;
+            for (k in 0..8) { hat.s[o + k * 2] = 1; }
+        } else {
+            kick.s[o] = 1; kick.s[o + 8] = 1; snare.s[o + 4] = 1; snare.s[o + 12] = 1;
+            for (k in 0..8) { hat.s[o + k * 2] = 1; }
+        }
+    }
+    let crash = lane_of(tr, "crash");
+    if (crash != null) { crash.s[0] = 1; }
+}
+
+// chord progression (root midi per bar) for a given minor/major template
+fn progression(style) -> any {
+    if (style == "House") { return [57, 53, 48, 55]; }
+    if (style == "Trap") { return [57, 57, 53, 55]; }
+    if (style == "Funk") { return [52, 52, 57, 55]; }
+    if (style == "Lo-fi") { return [50, 47, 55, 57]; }
+    return [57, 53, 48, 55];
+}
+
+fn fill_bass(tr, style, bars) {
+    tr.notes = [];
+    let prog = progression(style);
+    for (b in 0..bars) {
+        let r = prog[b % 4] - 24;
+        let o = b * 16;
+        if (style == "House") { for (k in 0..4) { push(tr.notes, { t: o + k * 4 + 2, l: 2, m: r, v: 100, s: false }); } }
+        else if (style == "Trap") { push(tr.notes, { t: o, l: 6, m: r, v: 100, s: false }); push(tr.notes, { t: o + 7, l: 3, m: r, v: 100, s: false }); push(tr.notes, { t: o + 10, l: 6, m: r + 7, v: 100, s: false }); }
+        else if (style == "Funk") { push(tr.notes, { t: o, l: 2, m: r, v: 100, s: false }); push(tr.notes, { t: o + 3, l: 1, m: r + 12, v: 100, s: false }); push(tr.notes, { t: o + 6, l: 2, m: r, v: 100, s: false }); push(tr.notes, { t: o + 10, l: 2, m: r + 7, v: 100, s: false }); push(tr.notes, { t: o + 12, l: 3, m: r + 5, v: 100, s: false }); }
+        else { push(tr.notes, { t: o, l: 8, m: r, v: 100, s: false }); push(tr.notes, { t: o + 8, l: 8, m: r + 7, v: 100, s: false }); }
+    }
+}
+
+fn fill_lead(tr, style, bars, seed) {
+    tr.notes = [];
+    let prog = progression(style);
+    let sc = scale_steps(style == "Funk" ? "Dorian" : "Minor");
+    srand(seed);
+    for (b in 0..bars) {
+        let o = b * 16;
+        let root = prog[b % 4] + 12;
+        var idx = rand() % len(sc);
+        for (k in 0..8) {
+            if (rand() % 100 < 62) {
+                idx = clamp(idx + (rand() % 5) - 2, 0, len(sc) - 1);
+                push(tr.notes, { t: o + k * 2, l: (rand() % 3 == 0) ? 3 : 2, m: root + sc[idx], v: 100, s: false });
+            }
+        }
+    }
+}
+
+fn apply_template(S, style) {
+    let st = S.st;
+    snapshot(S);
+    let bpms = { House: 124, Trap: 140, Funk: 104, "Lo-fi": 78, Basic: 110 };
+    let P = blank(style + " beat", bpms[style]);
+    P.bars = 4;
+    fill_drums(P.tracks[0], style, P.bars);
+    fill_bass(P.tracks[1], style, P.bars);
+    fill_lead(P.tracks[2], style, P.bars, 7 + st.rev);
+    P.swing = style == "Funk" ? 0.25 : (style == "Lo-fi" ? 0.3 : 0.0);
+    P.master = style == "Lo-fi" ? "lofi" : (style == "Trap" ? "phonk" : (style == "Funk" ? "funk" : "clean"));
+    P.tracks[1].inst = style == "Funk" ? "slap" : (style == "Trap" ? "808" : "bass");
+    P.tracks[2].inst = style == "Lo-fi" ? "epiano" : (style == "Trap" ? "bell" : "pluck");
+    st.P = P;
+    st.sel = 0;
+    st.page = 0;
+    st.fit_sel = -1;
+    st.dirty = true;
+}
+
+fn randomize(S) {
+    let st = S.st;
+    let tr = st.P.tracks[st.sel];
+    snapshot(S);
+    srand(int(system.time()) + st.rev);
+    st.rev += 1;
+    let n = steps_total(st.P);
+    if (tr.kind == "drum") {
+        for (l in tr.lanes) {
+            l.s = zeros(128);
+            if (l.d == "kick") { euclid(l.s, 4 + rand() % 3, 16, 0); }
+            else if (l.d == "snare") { l.s[4] = 1; l.s[12] = 1; }
+            else if (l.d == "hat") { euclid(l.s, 8 + (rand() % 4) * 2, 16, 0); }
+            else if (l.d == "clap") { if (rand() % 2 == 0) { l.s[12] = 1; } }
+            else if (l.d == "rim") { euclid(l.s, rand() % 4, 16, 3); }
+            else if (l.d == "ohat") { l.s[6] = 1; l.s[14] = 1; }
+            // repeat the first bar
+            for (i in 16..n) { l.s[i] = l.s[i % 16]; }
+        }
+    } else {
+        tr.notes = [];
+        let sc = scale_steps(st.scale);
+        var idx = rand() % len(sc);
+        let base = 12 * (st.oct + 1) + st.root;
+        for (k in 0..idiv(n, 2)) {
+            if (rand() % 100 < 60) {
+                idx = clamp(idx + (rand() % 5) - 2, 0, len(sc) * 2 - 1);
+                let m = base + sc[idx % len(sc)] + 12 * idiv(idx, len(sc));
+                push(tr.notes, { t: k * 2, l: 2, m: m, v: 100, s: false });
+            }
+        }
+    }
+    st.dirty = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// notation compiler
+// ---------------------------------------------------------------------------------------------
+fn rest_tok(n) -> any { return f"r:{n}/16"; }
+
+fn mix_opts(tr) -> any {
+    var o = sprintf("vol=%.2f pan=%.2f reverb=%.2f", tr.vol, tr.pan, tr.rev);
+    if (tr.glide > 0.001) { o = o + sprintf(" glide=%.2f", tr.glide); }
+    return o;
+}
+
+fn vel_suffix(level) -> any {
+    if (level == 2) { return "@118"; }
+    if (level == 3) { return "@52"; }
+    return "";
+}
+
+fn drum_line2(lane, n) -> any {
+    var toks = [];
+    var gap = 0;
+    for (i in 0..n) {
+        if (lane.s[i] != 0) {
+            if (gap > 0) { push(toks, rest_tok(gap)); gap = 0; }
+            push(toks, lane.d + ":1/16" + vel_suffix(lane.s[i]));
+        } else { gap += 1; }
+    }
+    if (gap > 0) { push(toks, rest_tok(gap)); }
+    return join(toks, " ");
+}
+
+fn note_line2(tr, n) -> any {
+    var starts = [];
+    for (nt in tr.notes) { if (nt.t < n && !(nt.t in starts)) { push(starts, nt.t); } }
+    starts = sorted(starts);
+    var toks = [];
+    var pos = 0;
+    for (k in 0..len(starts)) {
+        let s = starts[k];
+        let nxt = k + 1 < len(starts) ? starts[k + 1] : n;
+        if (s > pos) { push(toks, rest_tok(s - pos)); }
+        var names = [];
+        var ml = 1;
+        var vmax = 0;
+        var slide = false;
+        for (nt in tr.notes) {
+            if (nt.t == s) {
+                push(names, note_name(nt.m));
+                if (nt.l > ml) { ml = nt.l; }
+                if (nt.v > vmax) { vmax = nt.v; }
+                if (nt.s) { slide = true; }
+            }
+        }
+        let dur = min(ml, nxt - s);
+        let body = len(names) == 1 ? names[0] : "[" + join(names, " ") + "]";
+        var tok = f"{body}:{dur}/16";
+        if (vmax != 100) { tok = tok + "@" + vmax; }
+        if (slide) { tok = tok + "^"; }
+        push(toks, tok);
+        pos = s + dur;
+    }
+    if (pos < n) { push(toks, rest_tok(n - pos)); }
+    return join(toks, " ");
+}
+
+fn has_steps(lane, n) -> any {
+    for (i in 0..n) { if (lane.s[i] != 0) { return true; } }
+    return false;
+}
+
+fn any_solo(P) -> any {
+    for (tr in P.tracks) { if (tr.solo) { return true; } }
+    return false;
+}
+
+// per track: the notation track names it compiles to (a drum kit becomes one track per used lane)
+fn track_names(P, i) -> any {
+    let tr = P.tracks[i];
+    let n = steps_total(P);
+    var out = [];
+    if (tr.kind == "drum") {
+        for (l in tr.lanes) { if (has_steps(l, n)) { push(out, f"t{i + 1}_{l.d}"); } }
+    } else if (len(tr.notes) > 0) { push(out, f"t{i + 1}"); }
+    return out;
+}
+
+fn compile_opt(P, honour_mute) -> any {
+    let n = steps_total(P);
+    let solo = any_solo(P);
+    var out = f"title \"{P.name}\"\ncomposer Studio\ntempo {P.bpm}\ntime 4/4\n";
+    if (P.swing > 0.01) { out = out + sprintf("swing16=%.2f\n", P.swing); }
+    // samples
+    for (i in 0..len(P.tracks)) {
+        let tr = P.tracks[i];
+        if (tr.kind == "note" && tr.sample != "") { out = out + f"sample smp{i + 1} \"{tr.sample}\" root=C4\n"; }
+    }
+    for (i in 0..len(P.tracks)) {
+        let tr = P.tracks[i];
+        if (honour_mute) {
+            let audible = solo ? tr.solo : !tr.mute;
+            if (!audible) { continue; }
+        }
+        if (tr.kind == "drum") {
+            for (l in tr.lanes) {
+                if (has_steps(l, n)) { out = out + f"track t{i + 1}_{l.d} drums " + mix_opts(tr) + "\n" + drum_line2(l, n) + "\n"; }
+            }
+        } else if (len(tr.notes) > 0) {
+            let inst = tr.sample != "" ? "sample=smp" + (i + 1) : tr.inst;
+            out = out + f"track t{i + 1} {inst} " + mix_opts(tr) + "\n" + note_line2(tr, n) + "\n";
+        }
+    }
+    return out;
+}
+
+fn compile(P) -> any { return compile_opt(P, true); }
+
+fn join(arr, sep) -> any {
+    var s = "";
+    for (i in 0..len(arr)) { if (i > 0) { s = s + sep; } s = s + arr[i]; }
+    return s;
+}
+
+// ---------------------------------------------------------------------------------------------
+// rendering / playback
+// ---------------------------------------------------------------------------------------------
+fn render_options(P, extra) -> any {
+    var o = "tail=1.2";
+    if (P.humanize > 0.5) { o = o + sprintf(" humanize=%.0f seed=7", P.humanize); }
+    if (extra != "") { o = o + " " + extra; }
+    return o;
+}
+
+// audible, ducked tracks (names) and the kick lanes used as the sidechain key
+fn duck_plan(P) -> any {
+    let solo = any_solo(P);
+    var ducked = [];
+    var keys = [];
+    for (i in 0..len(P.tracks)) {
+        let tr = P.tracks[i];
+        let audible = solo ? tr.solo : !tr.mute;
+        if (!audible) { continue; }
+        if (tr.kind == "drum") {
+            for (nm in track_names(P, i)) { if ("kick" in nm) { push(keys, nm); } }
+        } else if (tr.duck) {
+            for (nm in track_names(P, i)) { push(ducked, nm); }
+        }
+    }
+    return { ducked: ducked, keys: keys };
+}
+
+fn render_audio(S) -> any {
+    let P = S.st.P;
+    let text = compile(P);
+    let plan = duck_plan(P);
+    var a = null;
+    if (P.duck_depth > 0.02 && len(plan.ducked) > 0 && len(plan.keys) > 0) {
+        let base = music_note.render(text, render_options(P, "mute=" + join(plan.ducked, ",")));
+        let key = music_note.render(text, render_options(P, "solo=" + join(plan.keys, ",")));
+        var parts = [base];
+        for (nm in plan.ducked) {
+            let raw = music_note.render(text, render_options(P, "solo=" + nm));
+            push(parts, music_note.sidechain(raw, key, sprintf("depth=%.2f", P.duck_depth)));
+            music_note.free(raw);
+        }
+        a = music_note.mix(parts);
+        for (x in parts) { music_note.free(x); }
+        music_note.free(key);
+    } else {
+        a = music_note.render(text, render_options(P, ""));
+    }
+    if (P.master != "none") {
+        let b = music_note.master(a, P.master);
+        music_note.free(a);
+        a = b;
+    }
+    return { audio: a, text: text };
+}
+
+// render the project and play it through the main player
+fn render_play(S, core_play) -> any {
+    let st = S.st;
+    let E = S.E;
+    var has = false;
+    for (i in 0..len(st.P.tracks)) { if (len(track_names(st.P, i)) > 0) { has = true; } }
+    if (!has) { ui.toast(S.U, "Nothing to render - add some notes"); return false; }
+    var r = null;
+    try { r = render_audio(S); } catch (e) { ui.toast(S.U, "Render error: " + e.message); return false; }
+    st.rev += 1;
+    let key = "studio_" + st.rev + "_" + system.pid();
+    let path = system.path_join(E.cache_dir, key + ".wav");
+    music_note.save_wav(r.audio, path, "bits=16");
+    let dur = music_note.info(r.audio).seconds;
+    music_note.free(r.audio);
+    let P = st.P;
+    let id = "studio:project";
+    let t = { id: id, key: key, title: P.name, artist: "You", album: "Studio", genre: "Studio", kind: "studio", src: "", style: "", opts: "",
+              dur: dur, fav: false, plays: 0, seed: lib.hash(P.name) % 997, added: 0, text: r.text };
+    S.byid[id] = t;
+    st.track = t;
+    st.rendered_rev = st.rev;
+    st.dirty = false;
+    st.last_text = r.text;
+    S.roll_id = "";
+    core_play(S, t);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// edit operations / generators
+// ---------------------------------------------------------------------------------------------
+fn double_length(S) -> any {
+    let P = S.st.P;
+    if (P.bars >= 8) { return false; }
+    snapshot(S);
+    let n = P.bars * 16;
+    for (tr in P.tracks) {
+        for (l in tr.lanes) { for (i in 0..n) { l.s[i + n] = l.s[i]; } }
+        var extra = [];
+        for (nt in tr.notes) { push(extra, { t: nt.t + n, l: nt.l, m: nt.m, v: nt.v, s: nt.s }); }
+        for (e in extra) { push(tr.notes, e); }
+    }
+    P.bars = P.bars * 2;
+    return true;
+}
+
+fn shift_track(S, tr, dir) {
+    snapshot(S);
+    let n = steps_total(S.st.P);
+    for (l in tr.lanes) {
+        var c = zeros(128);
+        for (i in 0..n) { c[((i + dir) % n + n) % n] = l.s[i]; }
+        l.s = c;
+    }
+    for (nt in tr.notes) { nt.t = ((nt.t + dir) % n + n) % n; }
+}
+
+fn transpose_track(S, tr, semi) {
+    snapshot(S);
+    for (nt in tr.notes) { nt.m = clamp(nt.m + semi, 12, 108); }
+}
+
+fn reverse_track(S, tr) {
+    snapshot(S);
+    let n = steps_total(S.st.P);
+    for (l in tr.lanes) {
+        var c = zeros(128);
+        for (i in 0..n) { c[n - 1 - i] = l.s[i]; }
+        l.s = c;
+    }
+    for (nt in tr.notes) { nt.t = max(0, n - nt.t - nt.l); }
+}
+
+fn humanize_track(S, tr) {
+    snapshot(S);
+    srand(int(system.time()) + S.st.rev);
+    for (nt in tr.notes) { nt.v = 78 + rand() % 40; }
+    for (l in tr.lanes) {
+        let n = steps_total(S.st.P);
+        for (i in 0..n) {
+            if (l.s[i] != 0) { let r = rand() % 10; l.s[i] = r < 6 ? 1 : (r < 8 ? 2 : 3); }
+        }
+    }
+}
+
+fn generate(S, kind) -> any {
+    let st = S.st;
+    let P = st.P;
+    let tr = P.tracks[st.sel];
+    let n = steps_total(P);
+    snapshot(S);
+    let sc = scale_steps(st.scale);
+    let base = 12 * (st.oct + 1) + st.root;
+    if (kind == "Drum fill") {
+        if (tr.kind != "drum") { return 0; }
+        for (l in tr.lanes) {
+            if (l.d == "snare" || l.d == "tom_lo" || l.d == "hat") { for (i in n - 4..n) { l.s[i] = 1; } }
+        }
+        let snare = lane_of(tr, "snare");
+        if (snare != null) { snare.s[n - 1] = 2; }
+    } else if (tr.kind == "note") {
+        tr.notes = [];
+        if (kind == "Arp up" || kind == "Arp up/down") {
+            let pat = kind == "Arp up" ? [0, 2, 4, 7] : [0, 2, 4, 7, 4, 2];
+            var deg = 0;
+            for (k in 0..n) {
+                let d = pat[k % len(pat)];
+                let m = base + sc[d % len(sc)] + 12 * idiv(d, len(sc));
+                push(tr.notes, { t: k, l: 1, m: m, v: k % 4 == 0 ? 112 : 92, s: false });
+            }
+        } else if (kind == "Chords") {
+            let prog = [0, 4, 5, 3];
+            for (b in 0..P.bars) {
+                let d = prog[b % 4];
+                let root = base + sc[d % len(sc)];
+                for (iv in [0, 2, 4]) {
+                    let dd = d + iv;
+                    push(tr.notes, { t: b * 16, l: 16, m: base + sc[dd % len(sc)] + 12 * idiv(dd, len(sc)), v: 90, s: false });
+                }
+            }
+        } else if (kind == "Bassline") {
+            let prog = [0, 4, 5, 3];
+            for (b in 0..P.bars) {
+                let r = base - 24 + sc[prog[b % 4] % len(sc)];
+                for (k in 0..4) { push(tr.notes, { t: b * 16 + k * 4, l: 3, m: k == 3 ? r + 7 : r, v: k == 0 ? 112 : 96, s: false }); }
+            }
+        }
+    }
+    st.dirty = true;
+}
+
+fn set_sample(S, tr, path) -> any {
+    if (tr.kind != "note") { return "Samples work on synth tracks"; }
+    if (!system.exists(path)) { return "File not found"; }
+    var secs = 0.0;
+    try { secs = music_note.wav_info(path).seconds; } catch (e) { return "Not a readable WAV"; }
+    tr.sample = path;
+    tr.inst = "sample";
+    S.st.dirty = true;
+    return "";
+}
+
+fn clear_sample(S, tr) {
+    tr.sample = "";
+    if (tr.inst == "sample") { tr.inst = "pluck"; }
+    S.st.dirty = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// note preview (audition a pitch when you click the piano roll)
+// ---------------------------------------------------------------------------------------------
+fn preview(S, inst, m) -> any {
+    let E = S.E;
+    if (E.silent) { return 0; }
+    let st = S.st;
+    if (st.preview != null) { system.kill(st.preview, true); system.proc_free(st.preview); st.preview = null; }
+    try {
+        let a = music_note.note(note_name(m), 0.45, "instrument=" + inst);
+        let path = system.path_join(system.temp_dir(), "cobra_preview_" + system.pid() + ".wav");
+        music_note.save_wav(a, path, "bits=16");
+        music_note.free(a);
+        st.preview = system.spawn(engine.player_argv(E.player, path), false);
+    } catch (e) { }
+}
+
+fn tick_preview(S) {
+    let st = S.st;
+    if (st.preview != null && system.poll(st.preview) != null) { system.proc_free(st.preview); st.preview = null; }
+}
+
+// ---------------------------------------------------------------------------------------------
+// project files + export
+// ---------------------------------------------------------------------------------------------
+fn project_dir(S) -> any {
+    let d = system.path_join(S.data_dir, "projects");
+    system.mkdir(d, true);
+    return d;
+}
+
+fn project_list(S) -> any {
+    var out = [];
+    let names = system.list_dir(project_dir(S));
+    if (names == null) { return out; }
+    for (n in names) { if (system.extension(n) == ".json") { push(out, system.stem(n)); } }
+    return out;
+}
+
+fn save_project(S) -> any {
+    let P = S.st.P;
+    let path = system.path_join(project_dir(S), lib.slug(P.name) + ".json");
+    try { json.write_file(path, P, 2); return path; } catch (e) { return null; }
+}
+
+fn open_project(S, name) -> any {
+    let path = system.path_join(project_dir(S), name + ".json");
+    try {
+        S.st.P = migrate(json.parse_file(path));
+        S.st.sel = 0;
+        S.st.page = 0;
+        S.st.undo = [];
+        S.st.dirty = true;
+        return true;
+    } catch (e) { return false; }
+}
+
+fn export_dir(S) -> any {
+    let d = system.path_join(S.data_dir, "exports");
+    system.mkdir(d, true);
+    return d;
+}
+
+fn export_wav(S) -> any {
+    let r = render_audio(S);
+    let path = system.path_join(export_dir(S), lib.slug(S.st.P.name) + ".wav");
+    music_note.save_wav(r.audio, path, "bits=24");
+    music_note.free(r.audio);
+    return path;
+}
+
+fn export_midi(S) -> any {
+    let path = system.path_join(export_dir(S), lib.slug(S.st.P.name) + ".mid");
+    music_note.to_midi(compile(S.st.P), path);
+    return path;
+}
+
+// write the project as a .kcm score into the library's music folder so it shows up in the Library
+fn export_kcm(S) -> any {
+    let dir = system.path_join(S.app_dir, "music");
+    system.mkdir(dir, true);
+    let path = system.path_join(dir, lib.slug(S.st.P.name) + ".kcm");
+    io.write_file(path, compile(S.st.P));
+    lib.rebuild(S);
+    return path;
+}
+
+// one WAV per track (drum kits are summed into a single stem); returns the folder
+fn export_stems(S) -> any {
+    let P = S.st.P;
+    let dir = system.path_join(export_dir(S), lib.slug(P.name) + "_stems");
+    system.mkdir(dir, true);
+    let all_text = compile_opt(P, false);
+    var count = 0;
+    for (i in 0..len(P.tracks)) {
+        let mine = track_names(P, i);
+        if (len(mine) == 0) { continue; }
+        var others = [];
+        for (j in 0..len(P.tracks)) { if (j != i) { for (nm in track_names(P, j)) { push(others, nm); } } }
+        let a = music_note.render(all_text, render_options(P, len(others) > 0 ? "mute=" + join(others, ",") : ""));
+        let m = music_note.normalize(a, -1.0);
+        music_note.free(a);
+        music_note.save_wav(m, system.path_join(dir, f"{i + 1}_" + lib.slug(P.tracks[i].name) + ".wav"), "bits=24");
+        music_note.free(m);
+        count += 1;
+    }
+    return dir;
+}
+
+// crash recovery: the current project is written to projects/_autosave.json (listed in Open)
+fn autosave(S) -> any {
+    let P = S.st.P;
+    var has = false;
+    for (i in 0..len(P.tracks)) { if (len(track_names(P, i)) > 0) { has = true; } }
+    if (!has) { return 0; }
+    let sig = json.stringify(P);
+    if (sig == S.studio_sig) { return 0; }
+    S.studio_sig = sig;
+    try { json.write_file(system.path_join(project_dir(S), "_autosave.json"), P, 2); } catch (e) { }
+}

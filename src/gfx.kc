@@ -1,0 +1,263 @@
+// gfx.kc — the graphics layer of Cobra Music Studio.
+//
+//   * one 1024x1024 texture ATLAS shared by everything below (shelf packer; if it ever fills up it is reset and the
+//     caches refill on demand)
+//   * TEXT: real TrueType fonts (src/ttf.kc) rasterised with the vector engine (src/vec.kc) at any pixel size,
+//     proportional advances, UTF-8, regular + bold, tracking (letter-spacing)
+//   * ICONS: real .svg files (assets/icons/*.svg) parsed + rasterised by src/vec.kc, tinted with any colour
+//   * anti-aliased discs and rounded rectangles
+// Everything is generated at run time by KingCobra code: no image or font library is involved.
+import std.game;
+import std.system;
+import std.io;
+import "vec.kc" as vec;
+import "ttf.kc" as ttf;
+
+const ATLAS = 1024;
+
+fn new(app_dir) -> any {
+    let G = {
+        app_dir: app_dir, tex: game.texture_new(ATLAS, ATLAS), x: 1, y: 1, rowh: 0, gen: 0,
+        fonts: [], cpc: {}, cpo: {}, glyphs: {}, icons: {}, discs: {}, widths: {}, svgs: {}, missing: {}, resets: 0,
+        icon_dir: system.path_join(app_dir, "assets", "icons"), gamma: 0.85
+    };
+    // fonts[0] = regular, fonts[1] = bold, fonts[2] = display (headings)
+    let fd = system.path_join(app_dir, "assets", "fonts");
+    for (name in ["InstrumentSans-Regular.ttf", "InstrumentSans-Bold.ttf", "Outfit-Bold.ttf"]) {
+        let p = system.path_join(fd, name);
+        var f = null;
+        if (system.exists(p)) { try { f = ttf.load(p); } catch (e) { f = null; } }
+        push(G.fonts, f);
+    }
+    // a system font as a last resort for the regular weight
+    if (G.fonts[0] == null) {
+        for (p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "C:\\Windows\\Fonts\\arial.ttf", "/Library/Fonts/Arial.ttf"]) {
+            if (G.fonts[0] == null && system.exists(p)) { try { G.fonts[0] = ttf.load(p); } catch (e) { } }
+        }
+    }
+    if (G.fonts[1] == null) { G.fonts[1] = G.fonts[0]; }
+    if (G.fonts[2] == null) { G.fonts[2] = G.fonts[1]; }
+    return G;
+}
+
+fn has_fonts(G) -> any { return G.fonts[0] != null; }
+
+// ---------------------------------------------------------------------------------------------
+// atlas
+// ---------------------------------------------------------------------------------------------
+fn reset(G) {
+    G.tex = game.texture_new(ATLAS, ATLAS);
+    G.x = 1; G.y = 1; G.rowh = 0;
+    G.gen += 1;
+    G.glyphs = {}; G.icons = {}; G.discs = {};
+    G.resets += 1;
+}
+
+// reserve a w*h rectangle (1px gutter); returns [x, y]
+fn alloc(G, w, h) -> any {
+    if (G.x + w + 1 > ATLAS) { G.x = 1; G.y += G.rowh + 1; G.rowh = 0; }
+    if (G.y + h + 1 > ATLAS) { reset(G); }
+    let pos = [G.x, G.y];
+    G.x += w + 1;
+    if (h > G.rowh) { G.rowh = h; }
+    return pos;
+}
+
+// upload a coverage mask as white pixels with alpha = coverage
+fn upload(G, px, py, cov, w, h) {
+    for (y in 0..h) {
+        let row = y * w;
+        for (x in 0..w) {
+            let c = cov[row + x];
+            let a = int(c * 255.0 + 0.5);
+            if (a > 0) { game.texture_set(G.tex, px + x, py + y, (a << 24) | 0xFFFFFF); }
+        }
+    }
+}
+
+fn tint_of(c) -> any { return c & 0xFFFFFF; }
+fn alpha_of(c) -> any { if (c > 0xFFFFFF) { return ((c >> 24) & 255) / 255.0; } return 1.0; }
+
+fn blit(G, e, x, y, c) {
+    game.sprite(G.tex, x, y, "sx", e.x, "sy", e.y, "sw", e.w, "sh", e.h, "tint", tint_of(c), "alpha", alpha_of(c));
+}
+
+// ---------------------------------------------------------------------------------------------
+// text
+// ---------------------------------------------------------------------------------------------
+// UTF-8 string -> array of code points (cached; plain ASCII strings take a fast path)
+fn cps(G, s) -> any {
+    if (s in G.cpc) { return G.cpc[s]; }
+    let n = len(s);
+    let b = buffer_from(s);
+    var out = [];
+    var i = 0;
+    while (i < n) {
+        let c = b.get_u8(i);
+        if (c < 128) { push(out, c); i += 1; }
+        else if (c >= 0xC0 && c < 0xE0 && i + 1 < n) { push(out, ((c & 0x1F) << 6) | (b.get_u8(i + 1) & 0x3F)); i += 2; }
+        else if (c >= 0xE0 && c < 0xF0 && i + 2 < n) { push(out, ((c & 0x0F) << 12) | ((b.get_u8(i + 1) & 0x3F) << 6) | (b.get_u8(i + 2) & 0x3F)); i += 3; }
+        else if (c >= 0xF0 && i + 3 < n) { push(out, ((c & 0x07) << 18) | ((b.get_u8(i + 1) & 0x3F) << 12) | ((b.get_u8(i + 2) & 0x3F) << 6) | (b.get_u8(i + 3) & 0x3F)); i += 4; }
+        else { push(out, 63); i += 1; }
+    }
+    b.free();
+    if (len(G.cpc) > 4000) { G.cpc = {}; G.cpo = {}; }
+    G.cpc[s] = out;
+    return out;
+}
+
+// byte offset of every code point (for cutting strings without splitting a UTF-8 sequence)
+fn cp_offsets(G, s) -> any {
+    if (s in G.cpo) { return G.cpo[s]; }
+    let n = len(s);
+    let b = buffer_from(s);
+    var offs = [];
+    for (i in 0..n) {
+        let c = b.get_u8(i);
+        if ((c & 0xC0) != 0x80) { push(offs, i); }
+    }
+    b.free();
+    G.cpo[s] = offs;
+    return offs;
+}
+
+// glyph entry for (font, code point, pixel size): { x, y, w, h (atlas), left, top (from pen/baseline), adv }
+fn glyph(G, fi, cp, px) -> any {
+    let key = fi + "/" + px + "/" + cp;
+    if (key in G.glyphs) { return G.glyphs[key]; }
+    let F = G.fonts[fi];
+    var gid = ttf.glyph_index(F, cp);
+    if (gid == 0 && cp != 63) { gid = ttf.glyph_index(F, 63); }
+    let s = px / (F.upm * 1.0);
+    let adv = ttf.advance(F, gid) * s;
+    let ol = ttf.outline(F, gid, 0);
+    var e = { x: 0, y: 0, w: 0, h: 0, left: 0, top: 0, adv: adv };
+    if (len(ol.contours) > 0) {
+        let left = int(floor(ol.xmin * s)) - 1;
+        let right = int(ceil(ol.xmax * s)) + 1;
+        let top = int(ceil(ol.ymax * s)) + 1;
+        let bot = int(floor(ol.ymin * s)) - 1;
+        let w = right - left;
+        let h = top - bot;
+        // outline coordinates: pen at (0,0); canvas origin = (left, top)
+        var polys = [];
+        for (ct in ol.contours) { push(polys, ttf.flatten(ct, s, -left * 1.0, top * 1.0)); }
+        let cov = vec.fill_path(polys, w, h, 0);
+        for (i in 0..w * h) { if (cov[i] > 0.0) { cov[i] = pow(cov[i], G.gamma); } }
+        let pos = alloc(G, w, h);
+        upload(G, pos[0], pos[1], cov, w, h);
+        e = { x: pos[0], y: pos[1], w: w, h: h, left: left, top: top, adv: adv };
+    }
+    G.glyphs[key] = e;
+    return e;
+}
+
+// font index: 0 regular, 1 bold, 2 display
+fn measure(G, s, px, fi, track) -> any {
+    if (G.fonts[0] == null) { return len(s) * px * 0.6; }
+    let key = fi + "/" + px + "/" + track + "/" + s;
+    if (key in G.widths) { return G.widths[key]; }
+    var w = 0.0;
+    for (cp in cps(G, s)) { w += glyph(G, fi, cp, px).adv + track; }
+    if (len(G.widths) > 3000) { G.widths = {}; }
+    G.widths[key] = w;
+    return w;
+}
+
+// draw text with its baseline at `by`
+fn text(G, x, by, s, px, fi, c, track) -> any {
+    var pen = x * 1.0;
+    for (cp in cps(G, s)) {
+        let g = glyph(G, fi, cp, px);
+        if (g.w > 0) { blit(G, g, int(floor(pen + 0.5)) + g.left, by - g.top, c); }
+        pen += g.adv + track;
+    }
+    return pen - x;
+}
+
+fn line_height(G, px, fi) -> any {
+    let F = G.fonts[fi];
+    return int((F.ascent - F.descent + F.gap) * px / (F.upm * 1.0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// SVG icons
+// ---------------------------------------------------------------------------------------------
+fn svg_doc(G, name) -> any {
+    if (name in G.svgs) { return G.svgs[name]; }
+    if (name in G.missing) { return null; }
+    let p = system.path_join(G.icon_dir, name + ".svg");
+    if (!system.exists(p)) { G.missing[name] = true; return null; }
+    let doc = vec.parse(io.read_file(p));
+    G.svgs[name] = doc;
+    return doc;
+}
+
+fn has_icon(G, name) -> any { return svg_doc(G, name) != null; }
+
+// draw icon `name` centred at (cx, cy), `size` px, tinted `c`. returns false if there is no such svg
+fn icon(G, name, cx, cy, size, c) -> any {
+    let doc = svg_doc(G, name);
+    if (doc == null) { return false; }
+    let key = name + "/" + size;
+    var e = null;
+    if (key in G.icons) { e = G.icons[key]; }
+    else {
+        let cov = vec.render(doc, size, size, 0.0);
+        let pos = alloc(G, size, size);
+        upload(G, pos[0], pos[1], cov, size, size);
+        e = { x: pos[0], y: pos[1], w: size, h: size };
+        G.icons[key] = e;
+    }
+    blit(G, e, cx - idiv(size, 2), cy - idiv(size, 2), c);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// anti-aliased discs and rounded rectangles
+// ---------------------------------------------------------------------------------------------
+fn disc_entry(G, r) -> any {
+    let key = "" + r;
+    if (key in G.discs) { return G.discs[key]; }
+    let d = r * 2;
+    var cov = [];
+    for (y in 0..d) {
+        for (x in 0..d) {
+            let dx = x + 0.5 - r;
+            let dy = y + 0.5 - r;
+            let dist = sqrt(dx * dx + dy * dy);
+            push(cov, clamp(r - dist + 0.5, 0.0, 1.0));
+        }
+    }
+    let pos = alloc(G, d, d);
+    upload(G, pos[0], pos[1], cov, d, d);
+    let e = { x: pos[0], y: pos[1], w: d, h: d };
+    G.discs[key] = e;
+    return e;
+}
+
+fn disc(G, cx, cy, r, c) -> any {
+    if (r < 1) { return 0; }
+    let e = disc_entry(G, r);
+    blit(G, e, cx - r, cy - r, c);
+    return 0;
+}
+
+fn rrect(G, x, y, w, h, r0, c) -> any {
+    var r = r0;
+    if (r * 2 > w) { r = idiv(w, 2); }
+    if (r * 2 > h) { r = idiv(h, 2); }
+    if (r <= 1) { game.rect(x, y, w, h, c); return 0; }
+    game.rect(x + r, y, w - 2 * r, h, c);
+    game.rect(x, y + r, r, h - 2 * r, c);
+    game.rect(x + w - r, y + r, r, h - 2 * r, c);
+    let e = disc_entry(G, r);
+    let tn = tint_of(c);
+    let al = alpha_of(c);
+    // four quadrants of the disc
+    game.sprite(G.tex, x, y, "sx", e.x, "sy", e.y, "sw", r, "sh", r, "tint", tn, "alpha", al);
+    game.sprite(G.tex, x + w - r, y, "sx", e.x + r, "sy", e.y, "sw", r, "sh", r, "tint", tn, "alpha", al);
+    game.sprite(G.tex, x, y + h - r, "sx", e.x, "sy", e.y + r, "sw", r, "sh", r, "tint", tn, "alpha", al);
+    game.sprite(G.tex, x + w - r, y + h - r, "sx", e.x + r, "sy", e.y + r, "sw", r, "sh", r, "tint", tn, "alpha", al);
+    return 0;
+}

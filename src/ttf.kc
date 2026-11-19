@@ -1,0 +1,235 @@
+// ttf.kc — a TrueType (glyf) font parser written in KingCobra.
+// Reads head/maxp/hhea/hmtx/cmap(4,12)/loca/glyf (simple + composite glyphs) from a .ttf file held in a buffer and
+// turns glyph outlines into flattened polygons that vec.kc can rasterise at any pixel size.
+import std.io;
+import "vec.kc" as vec;
+
+fn tag_at(b, off) -> any { return b.to_string(off, 4); }
+
+fn load(path) -> any {
+    let data = io.read_file(path);
+    let b = buffer_from(data);
+    let n = b.get_u16_be(4);
+    var tabs = {};
+    for (i in 0..n) {
+        let o = 12 + i * 16;
+        tabs[tag_at(b, o)] = b.get_u32_be(o + 8);
+    }
+    if (!("glyf" in tabs) || !("loca" in tabs) || !("head" in tabs)) { return null; }
+    let head = tabs["head"];
+    let hhea = tabs["hhea"];
+    let F = {
+        path: path, b: b, tabs: tabs,
+        upm: b.get_u16_be(head + 18), loc_fmt: b.get_i16_be(head + 50),
+        nglyphs: b.get_u16_be(tabs["maxp"] + 4),
+        ascent: b.get_i16_be(hhea + 4), descent: b.get_i16_be(hhea + 6), gap: b.get_i16_be(hhea + 8),
+        nhm: b.get_u16_be(hhea + 34),
+        cmap_off: -1, cmap_fmt: 0, gcache: {}, ccache: {}
+    };
+    // pick the best unicode cmap subtable
+    let cm = tabs["cmap"];
+    let ns = b.get_u16_be(cm + 2);
+    var best = -1;
+    var bestfmt = 0;
+    for (i in 0..ns) {
+        let pid = b.get_u16_be(cm + 4 + i * 8);
+        let eid = b.get_u16_be(cm + 6 + i * 8);
+        let off = cm + b.get_u32_be(cm + 8 + i * 8);
+        let fmt = b.get_u16_be(off);
+        if ((pid == 3 && eid == 10 && fmt == 12) || (pid == 0 && fmt == 12)) { best = off; bestfmt = 12; }
+        else if (bestfmt != 12 && fmt == 4 && ((pid == 3 && eid == 1) || pid == 0)) { best = off; bestfmt = 4; }
+    }
+    F.cmap_off = best;
+    F.cmap_fmt = bestfmt;
+    return F;
+}
+
+// unicode code point -> glyph index (0 = missing)
+fn glyph_index(F, cp) -> any {
+    let ck = "c" + cp;
+    if (ck in F.ccache) { return F.ccache[ck]; }
+    let b = F.b;
+    let off = F.cmap_off;
+    var gid = 0;
+    if (off >= 0 && F.cmap_fmt == 4) {
+        let segx2 = b.get_u16_be(off + 6);
+        let ends = off + 14;
+        let starts = ends + segx2 + 2;
+        let deltas = starts + segx2;
+        let ranges = deltas + segx2;
+        var i = 0;
+        while (i < segx2) {
+            let e = b.get_u16_be(ends + i);
+            if (cp <= e) {
+                let s = b.get_u16_be(starts + i);
+                if (cp >= s) {
+                    let ro = b.get_u16_be(ranges + i);
+                    let dl = b.get_i16_be(deltas + i);
+                    if (ro == 0) { gid = (cp + dl) & 0xFFFF; }
+                    else {
+                        let ga = b.get_u16_be(ranges + i + ro + (cp - s) * 2);
+                        if (ga != 0) { gid = (ga + dl) & 0xFFFF; }
+                    }
+                }
+                break;
+            }
+            i += 2;
+        }
+    } else if (off >= 0 && F.cmap_fmt == 12) {
+        let ng = b.get_u32_be(off + 12);
+        for (i in 0..ng) {
+            let g = off + 16 + i * 12;
+            let s = b.get_u32_be(g);
+            let e = b.get_u32_be(g + 4);
+            if (cp >= s && cp <= e) { gid = b.get_u32_be(g + 8) + (cp - s); break; }
+        }
+    }
+    F.ccache[ck] = gid;
+    return gid;
+}
+
+fn advance(F, gid) -> any {
+    let h = F.tabs["hmtx"];
+    let i = gid < F.nhm ? gid : F.nhm - 1;
+    return F.b.get_u16_be(h + i * 4);
+}
+
+fn glyph_range(F, gid) -> any {
+    let loca = F.tabs["loca"];
+    let b = F.b;
+    var a = 0;
+    var e = 0;
+    if (F.loc_fmt == 0) { a = b.get_u16_be(loca + gid * 2) * 2; e = b.get_u16_be(loca + gid * 2 + 2) * 2; }
+    else { a = b.get_u32_be(loca + gid * 4); e = b.get_u32_be(loca + gid * 4 + 4); }
+    return [F.tabs["glyf"] + a, e - a];
+}
+
+// outline of a glyph in font units: { contours: [ [ [x,y,on], ... ], ... ], xmin, ymin, xmax, ymax }
+fn outline(F, gid, depth) -> any {
+    let key = "" + gid;
+    if (depth == 0 && key in F.gcache) { return F.gcache[key]; }
+    let b = F.b;
+    let r = glyph_range(F, gid);
+    var out = { contours: [], xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
+    if (r[1] <= 0 || depth > 6) { if (depth == 0) { F.gcache[key] = out; } return out; }
+    let g = r[0];
+    let nc = b.get_i16_be(g);
+    out.xmin = b.get_i16_be(g + 2); out.ymin = b.get_i16_be(g + 4);
+    out.xmax = b.get_i16_be(g + 6); out.ymax = b.get_i16_be(g + 8);
+    if (nc >= 0) {
+        var p = g + 10;
+        var ends = [];
+        for (i in 0..nc) { push(ends, b.get_u16_be(p + i * 2)); }
+        p += nc * 2;
+        let ilen = b.get_u16_be(p);
+        p += 2 + ilen;
+        let np = nc > 0 ? ends[nc - 1] + 1 : 0;
+        var flags = [];
+        while (len(flags) < np) {
+            let f = b.get_u8(p);
+            p += 1;
+            push(flags, f);
+            if ((f & 8) != 0) {
+                var rep = b.get_u8(p);
+                p += 1;
+                while (rep > 0) { push(flags, f); rep -= 1; }
+            }
+        }
+        var xs = [];
+        var v = 0;
+        for (i in 0..np) {
+            let f = flags[i];
+            if ((f & 2) != 0) {
+                let d = b.get_u8(p); p += 1;
+                v += (f & 16) != 0 ? d : -d;
+            } else if ((f & 16) == 0) { v += b.get_i16_be(p); p += 2; }
+            push(xs, v);
+        }
+        var ys = [];
+        v = 0;
+        for (i in 0..np) {
+            let f = flags[i];
+            if ((f & 4) != 0) {
+                let d = b.get_u8(p); p += 1;
+                v += (f & 32) != 0 ? d : -d;
+            } else if ((f & 32) == 0) { v += b.get_i16_be(p); p += 2; }
+            push(ys, v);
+        }
+        var start = 0;
+        for (c in 0..nc) {
+            var pts = [];
+            for (i in start..ends[c] + 1) { push(pts, [xs[i] * 1.0, ys[i] * 1.0, (flags[i] & 1) != 0]); }
+            push(out.contours, pts);
+            start = ends[c] + 1;
+        }
+    } else {
+        var p = g + 10;
+        var more = true;
+        while (more) {
+            let fl = b.get_u16_be(p);
+            let sub = b.get_u16_be(p + 2);
+            p += 4;
+            var dx = 0.0; var dy = 0.0;
+            if ((fl & 1) != 0) { dx = b.get_i16_be(p) * 1.0; dy = b.get_i16_be(p + 2) * 1.0; p += 4; }
+            else { dx = b.get_i8(p) * 1.0; dy = b.get_i8(p + 1) * 1.0; p += 2; }
+            if ((fl & 2) == 0) { dx = 0.0; dy = 0.0; }
+            var a = 1.0; var bb = 0.0; var c = 0.0; var d = 1.0;
+            if ((fl & 8) != 0) { a = b.get_i16_be(p) / 16384.0; d = a; p += 2; }
+            else if ((fl & 0x40) != 0) { a = b.get_i16_be(p) / 16384.0; d = b.get_i16_be(p + 2) / 16384.0; p += 4; }
+            else if ((fl & 0x80) != 0) {
+                a = b.get_i16_be(p) / 16384.0; bb = b.get_i16_be(p + 2) / 16384.0;
+                c = b.get_i16_be(p + 4) / 16384.0; d = b.get_i16_be(p + 6) / 16384.0; p += 8;
+            }
+            let so = outline(F, sub, depth + 1);
+            for (ct in so.contours) {
+                var np2 = [];
+                for (pt in ct) { push(np2, [a * pt[0] + c * pt[1] + dx, bb * pt[0] + d * pt[1] + dy, pt[2]]); }
+                push(out.contours, np2);
+            }
+            more = (fl & 0x20) != 0;
+        }
+    }
+    if (depth == 0) { F.gcache[key] = out; }
+    return out;
+}
+
+// glyph contour (on/off-curve points) -> flat polygon (pixel space, y down). s = pixel scale, ox/oy = origin offset
+fn flatten(contour, s, ox, oy) -> any {
+    let n = len(contour);
+    if (n < 2) { return []; }
+    // start at an on-curve point
+    var si = -1;
+    for (i in 0..n) { if (contour[i][2]) { si = i; break; } }
+    var sx = 0.0; var sy = 0.0;
+    var order = [];
+    if (si >= 0) {
+        for (k in 0..n) { push(order, contour[(si + k) % n]); }
+        sx = order[0][0]; sy = order[0][1];
+    } else {
+        // all off-curve: start at the midpoint of the first two
+        sx = (contour[0][0] + contour[1][0]) / 2.0; sy = (contour[0][1] + contour[1][1]) / 2.0;
+        for (k in 0..n) { push(order, contour[(1 + k) % n]); }
+        var shifted = [[sx, sy, true]];
+        for (o in order) { push(shifted, o); }
+        order = shifted;
+    }
+    var out = [ox + sx * s, oy - sy * s];
+    var cx = sx; var cy = sy;
+    var i = 1;
+    let m = len(order);
+    while (i <= m) {
+        let pt = order[i % m];
+        if (pt[2]) {
+            push(out, ox + pt[0] * s); push(out, oy - pt[1] * s);
+            cx = pt[0]; cy = pt[1];
+            i += 1;
+        } else {
+            let nx = order[(i + 1) % m];
+            var ex = nx[0]; var ey = nx[1];
+            if (!nx[2]) { ex = (pt[0] + nx[0]) / 2.0; ey = (pt[1] + nx[1]) / 2.0; i += 1; } else { i += 2; }
+            vec.quad_pts(out, ox + cx * s, oy - cy * s, ox + pt[0] * s, oy - pt[1] * s, ox + ex * s, oy - ey * s);
+            cx = ex; cy = ey;
+        }
+    }
+    return out;
+}

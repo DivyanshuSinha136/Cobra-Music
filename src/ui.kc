@@ -1,0 +1,846 @@
+// ui.kc — a small immediate-mode widget toolkit written in KingCobra itself.
+//
+// It does NOT use std.gui. Everything here (layout helpers, hit-testing, buttons, sliders, text input,
+// scroll areas, context menus, tooltips, toasts, icons) is plain KingCobra drawing on top of the
+// raw 2D canvas + input of std.game (rect / circle / text / mouse / keyboard).
+//
+// Immediate-mode means there is no widget tree: every frame the app calls ui.begin(), then calls widget
+// functions such as ui.button(...) which draw AND report interaction (a click, a new slider value...),
+// then ui.finish() draws overlays (menu, tooltip, toasts).
+import std.game;
+import std.system;
+import "gfx.kc" as gfx;
+
+// graphics layer (fonts, SVG icons, anti-aliased shapes); module-level so every widget can use it
+var GFX = null;
+const SZ = [0, 12, 17, 27];
+
+var GFX_TRIED = false;
+
+// Every `import` of this file is its own module instance in KingCobra, so each one lazily builds its own graphics
+// layer (own texture atlas) from the app directory published in the environment by app.create().
+fn init_gfx(app_dir) -> any {
+    GFX_TRIED = true;
+    GFX = gfx.new(app_dir);
+    return gfx.has_fonts(GFX);
+}
+
+fn gfx_ready() -> any {
+    if (GFX == null && !GFX_TRIED) {
+        GFX_TRIED = true;
+        let d = system.getenv("KC_MUSIC_APP");
+        if (d != null && d != "") { GFX = gfx.new(d); }
+    }
+    return GFX != null && gfx.has_fonts(GFX);
+}
+
+fn new() -> any {
+    return {
+        mx: 0, my: 0, down: false, pressed: false, released: false, rpressed: false,
+        wheel: 0, inject_wheel: 0, typed: "", inject_text: "", t: 0.0, dt: 0.016, frame: 0,
+        hot: "", active: "", focus: "", lock: false, dbl: false, changed: false,
+        cx: 0, cy: 0, cw: 100000, ch: 100000,
+        anim: {}, scr: {}, grab: 0.0, drag_f: 0.0, drag_end: "", drag_id: "",
+        menu: null, choice: null, toasts: [],
+        tip_cand: "", tip_prev: "", tip_t: 0.0, tip_x: 0, tip_y: 0, tip_w: 0, tip_h: 0,
+        last_press_t: -10.0, last_px: 0, last_py: 0,
+        bs_t: 0.0, submit: "", caret_t: 0.0, invert_scroll: false, text_hit: false, T: null, W: 1280, H: 720
+    };
+}
+
+// ----------------------------------------------------------------------------------------------
+// frame lifecycle
+// ----------------------------------------------------------------------------------------------
+fn begin(U, T, dt) {
+    U.T = T;
+    U.dt = dt;
+    U.t += dt;
+    U.frame += 1;
+    let m = game.mouse();
+    U.mx = m[0];
+    U.my = m[1];
+    U.down = game.mouse_down(1);
+    U.pressed = game.mouse_pressed(1);
+    U.released = game.mouse_released(1);
+    U.rpressed = game.mouse_pressed(3);
+    U.wheel = game.wheel() + U.inject_wheel;
+    U.inject_wheel = 0;
+    if (U.invert_scroll) { U.wheel = 0 - U.wheel; }
+    U.typed = game.typed() + U.inject_text;
+    U.inject_text = "";
+    U.dbl = false;
+    if (U.pressed) {
+        if (U.t - U.last_press_t < 0.35 && abs(U.mx - U.last_px) < 6 && abs(U.my - U.last_py) < 6) {
+            U.dbl = true;
+            U.last_press_t = -10.0;
+        } else {
+            U.last_press_t = U.t;
+        }
+        U.last_px = U.mx;
+        U.last_py = U.my;
+    }
+    U.lock = U.menu != null;
+    U.hot = "";
+    U.changed = false;
+    U.submit = "";
+    U.drag_end = "";
+    U.tip_cand = "";
+    U.caret_t += dt;
+    clip_reset(U);
+}
+
+// Draw overlays (context menu, tooltip, toasts). Call last.
+fn finish(U) {
+    clip_reset(U);
+    U.lock = false;
+    draw_menu(U);
+    draw_tooltip(U);
+    draw_toasts(U);
+    if (U.menu == null && U.active == "" && U.focus != "" && U.pressed && !U.text_hit) { U.focus = ""; }
+    U.text_hit = false;
+}
+
+fn clip_set(U, x, y, w, h) {
+    U.cx = x;
+    U.cy = y;
+    U.cw = w;
+    U.ch = h;
+    game.clip(x, y, w, h);
+}
+
+fn clip_reset(U) {
+    U.cx = 0;
+    U.cy = 0;
+    U.cw = 100000;
+    U.ch = 100000;
+    game.clip();
+}
+
+fn inside(U, x, y, w, h) -> any {
+    if (U.mx < x || U.my < y || U.mx >= x + w || U.my >= y + h) { return false; }
+    if (U.mx < U.cx || U.my < U.cy || U.mx >= U.cx + U.cw || U.my >= U.cy + U.ch) { return false; }
+    return true;
+}
+
+fn hit(U, x, y, w, h) -> any {
+    if (U.lock) { return false; }
+    return inside(U, x, y, w, h);
+}
+
+// smooth value that eases toward `target` (used for hover fades, bar levels, panel slides)
+fn anim(U, id, target, speed) -> any {
+    if (!(id in U.anim)) { U.anim[id] = target; }
+    var v = U.anim[id];
+    v += (target - v) * clamp(U.dt * speed, 0.0, 1.0);
+    if (abs(target - v) < 0.002) { v = target; }
+    U.anim[id] = v;
+    return v;
+}
+
+fn toast(U, msg) {
+    U.toasts = push_toast(U.toasts, msg, U.t);
+}
+
+fn push_toast(list, msg, t) -> any {
+    var out = [];
+    var start = 0;
+    if (len(list) >= 3) { start = len(list) - 2; }
+    for (i in start..len(list)) { push(out, list[i]); }
+    push(out, { text: msg, t0: t });
+    return out;
+}
+
+// ----------------------------------------------------------------------------------------------
+// text helpers (the built-in font is a fixed 8x8 bitmap: every glyph is 8*scale pixels wide)
+// ----------------------------------------------------------------------------------------------
+fn font_for(sc, bold) -> any {
+    if (sc >= 3) { return 2; }
+    return bold ? 1 : 0;
+}
+
+// width in pixels of `s` at size class sc (1 small, 2 body, 3 heading)
+fn tw(s, sc) -> any {
+    if (!gfx_ready()) { return len(s) * 8 * sc; }
+    return int(ceil(gfx.measure(GFX, s, SZ[sc], font_for(sc, false), 0.0)));
+}
+
+fn tw_b(s, sc) -> any {
+    if (!gfx_ready()) { return len(s) * 8 * sc; }
+    return int(ceil(gfx.measure(GFX, s, SZ[sc], font_for(sc, true), 0.0)));
+}
+
+// shorten with ".." so that it fits maxw pixels (cuts on code-point boundaries)
+fn fit(s, maxw, sc) -> any {
+    if (!gfx_ready()) {
+        let maxc = idiv(maxw, 8 * sc);
+        if (len(s) <= maxc) { return s; }
+        if (maxc <= 3) { return ""; }
+        return s[0..maxc - 2] + "..";
+    }
+    if (tw(s, sc) <= maxw) { return s; }
+    let offs = gfx.cp_offsets(GFX, s);
+    var k = len(offs) - 1;
+    while (k > 0) {
+        let cand = s[0..offs[k]] + "..";
+        if (tw(cand, sc) <= maxw) { return cand; }
+        k -= 1;
+    }
+    return "";
+}
+
+// text whose TOP of an (8*sc)-pixel cell is at y (same convention as the old bitmap font)
+fn text_f(x, y, s, c, sc, bold) -> any {
+    if (!gfx_ready()) { game.text(x, y, s, c, sc); return 0; }
+    let px = SZ[sc];
+    gfx.text(GFX, x, y + 4 * sc + int(px * 0.36), s, px, font_for(sc, bold), c, 0.0);
+    return 0;
+}
+
+fn text(x, y, s, c, sc) { text_f(x, y, s, c, sc, false); }
+fn text_b(x, y, s, c, sc) { text_f(x, y, s, c, sc, true); }
+
+fn text_c(cx, y, s, c, sc) { text_f(cx - idiv(tw(s, sc), 2), y, s, c, sc, false); }
+fn text_cb(cx, y, s, c, sc) { text_f(cx - idiv(tw_b(s, sc), 2), y, s, c, sc, true); }
+fn text_r(rx, y, s, c, sc) { text_f(rx - tw(s, sc), y, s, c, sc, false); }
+fn text_fit(x, y, maxw, s, c, sc) { text_f(x, y, fit(s, maxw, sc), c, sc, false); }
+
+// small-caps style section label: bold, 11 px, tracked
+// display font (Outfit Bold) at an arbitrary pixel size; y is the top of the line
+fn text_display(x, y, s, c, px, track) -> any {
+    if (!gfx_ready()) { game.text(x, y, s, c, 2); return 0; }
+    gfx.text(GFX, x, y + int(px * 0.78), s, px, 2, c, track);
+    return 0;
+}
+
+fn text_fit_b(x, y, maxw, s, c, sc) { text_f(x, y, fit(s, maxw, sc), c, sc, true); }
+
+fn label(x, y, s, c) -> any {
+    if (!gfx_ready()) { game.text(x, y, s, c, 1); return 0; }
+    gfx.text(GFX, x, y + 8, s, 11, 1, c, 1.1);
+    return 0;
+}
+
+fn label_w(s) -> any {
+    if (!gfx_ready()) { return len(s) * 8; }
+    return int(ceil(gfx.measure(GFX, s, 11, 1, 1.1)));
+}
+
+fn fmt_time(sec) -> any {
+    var s = int(sec);
+    if (s < 0) { s = 0; }
+    let m = idiv(s, 60);
+    let r = s - m * 60;
+    if (m >= 60) {
+        let h = idiv(m, 60);
+        return sprintf("%d:%02d:%02d", h, m - h * 60, r);
+    }
+    return sprintf("%d:%02d", m, r);
+}
+
+// ----------------------------------------------------------------------------------------------
+// shapes
+// ----------------------------------------------------------------------------------------------
+fn disc(cx, cy, r, c) {
+    if (gfx_ready()) { gfx.disc(GFX, cx, cy, r, c); } else { game.circle(cx, cy, r, c); }
+}
+
+fn rrect(x, y, w, h, r, c) -> any {
+    if (gfx_ready()) { gfx.rrect(GFX, x, y, w, h, r, c); return 0; }
+    var rr = r;
+    if (rr * 2 > w) { rr = idiv(w, 2); }
+    if (rr * 2 > h) { rr = idiv(h, 2); }
+    if (rr <= 1) { game.rect(x, y, w, h, c); return 0; }
+    game.rect(x + rr, y, w - 2 * rr, h, c);
+    game.rect(x, y + rr, rr, h - 2 * rr, c);
+    game.rect(x + w - rr, y + rr, rr, h - 2 * rr, c);
+    game.circle(x + rr, y + rr, rr, c);
+    game.circle(x + w - rr - 1, y + rr, rr, c);
+    game.circle(x + rr, y + h - rr - 1, rr, c);
+    game.circle(x + w - rr - 1, y + h - rr - 1, rr, c);
+    return 0;
+}
+
+fn rrect_border(x, y, w, h, r, c, border, bc) {
+    rrect(x, y, w, h, r, bc);
+    rrect(x + border, y + border, w - 2 * border, h - 2 * border, max(0, r - border), c);
+}
+
+fn shadow(x, y, w, h, r) {
+    // cheap layered soft shadow
+    rrect(x - 2, y + 3, w + 4, h + 4, r + 2, 0x18000000);
+    rrect(x - 1, y + 2, w + 2, h + 2, r + 1, 0x20000000);
+}
+
+fn panel(U, x, y, w, h, r) {
+    rrect_border(x, y, w, h, r, U.T.panel, 1, U.T.line);
+}
+
+fn hline(x, y, w, c) { game.rect(x, y, w, 1, c); }
+fn vline(x, y, h, c) { game.rect(x, y, 1, h, c); }
+
+// ----------------------------------------------------------------------------------------------
+// icons — drawn with primitives so they scale and take any colour
+// ----------------------------------------------------------------------------------------------
+fn icon(name, cx, cy, s, c) -> any {
+    if (gfx_ready()) {
+        let px = max(10, s + 4);
+        if (gfx.icon(GFX, name, cx, cy, px, c)) { return 0; }
+    }
+    icon_prim(name, cx, cy, s, c);
+}
+
+fn icon_prim(name, cx, cy, s, c) {
+    let h = idiv(s, 2);
+    let q = idiv(s, 4);
+    let t = max(2, idiv(s, 8));
+    if (name == "play") {
+        game.triangle(cx - q, cy - h + 1, cx - q, cy + h - 1, cx + h - 1, cy, c);
+    } else if (name == "pause") {
+        game.rect(cx - h + 2, cy - h + 1, q + 1, s - 2, c);
+        game.rect(cx + 1, cy - h + 1, q + 1, s - 2, c);
+    } else if (name == "stop") {
+        game.rect(cx - h + 2, cy - h + 2, s - 4, s - 4, c);
+    } else if (name == "next") {
+        game.triangle(cx - h + 1, cy - h + 2, cx - h + 1, cy + h - 2, cx + q, cy, c);
+        game.rect(cx + q + 1, cy - h + 2, t, s - 4, c);
+    } else if (name == "prev") {
+        game.triangle(cx + h - 1, cy - h + 2, cx + h - 1, cy + h - 2, cx - q, cy, c);
+        game.rect(cx - q - t, cy - h + 2, t, s - 4, c);
+    } else if (name == "shuffle") {
+        game.line(cx - h, cy - q, cx - 2, cy - q, c, t);
+        game.line(cx - 2, cy - q, cx + 2, cy + q, c, t);
+        game.line(cx + 2, cy + q, cx + h - 4, cy + q, c, t);
+        game.line(cx - h, cy + q, cx - 2, cy + q, c, t);
+        game.line(cx - 2, cy + q, cx + 2, cy - q, c, t);
+        game.line(cx + 2, cy - q, cx + h - 4, cy - q, c, t);
+        game.triangle(cx + h - 5, cy - q - 4, cx + h - 5, cy - q + 4, cx + h, cy - q, c);
+        game.triangle(cx + h - 5, cy + q - 4, cx + h - 5, cy + q + 4, cx + h, cy + q, c);
+    } else if (name == "repeat" || name == "repeat1") {
+        game.rect(cx - h + 1, cy - q, s - 2, t, c);
+        game.rect(cx - h + 1, cy + q - t + 1, s - 2, t, c);
+        game.rect(cx - h + 1, cy - q, t, q * 2 - 1, c);
+        game.rect(cx + h - t - 1, cy - q, t, q * 2 - 1, c);
+        game.triangle(cx + 2, cy - q - 5, cx + 2, cy - q + 5, cx + 8, cy - q, c);
+        if (name == "repeat1") { game.text(cx - 3, cy - 4, "1", c, 1); }
+    } else if (name == "vol" || name == "mute") {
+        game.rect(cx - h, cy - q + 1, q + 1, q * 2 - 1, c);
+        game.triangle(cx - h + q, cy - q + 1, cx - h + q, cy + q - 1, cx + 1, cy + h - 2, c);
+        game.triangle(cx - h + q, cy - q + 1, cx + 1, cy - h + 2, cx + 1, cy + h - 2, c);
+        game.triangle(cx - h + q, cy + q - 1, cx + 1, cy - h + 2, cx + 1, cy + h - 2, c);
+        if (name == "mute") {
+            game.line(cx + 4, cy - q, cx + h, cy + q, c, t);
+            game.line(cx + 4, cy + q, cx + h, cy - q, c, t);
+        } else {
+            game.line(cx + 4, cy - 3, cx + 4, cy + 3, c, t);
+            game.line(cx + 8, cy - 6, cx + 8, cy + 6, c, t);
+        }
+    } else if (name == "heart" || name == "heart_on") {
+        let r = max(3, idiv(s, 4));
+        let fill = true;
+        game.circle(cx - r + 1, cy - r + 2, r, c, fill);
+        game.circle(cx + r - 1, cy - r + 2, r, c, fill);
+        game.triangle(cx - 2 * r + 1, cy - r + 4, cx + 2 * r - 1, cy - r + 4, cx, cy + h - 1, c, fill);
+    } else if (name == "plus") {
+        game.rect(cx - h + 2, cy - 1, s - 4, t, c);
+        game.rect(cx - 1, cy - h + 2, t, s - 4, c);
+    } else if (name == "minus") {
+        game.rect(cx - h + 2, cy - 1, s - 4, t, c);
+    } else if (name == "close") {
+        game.line(cx - q, cy - q, cx + q, cy + q, c, t);
+        game.line(cx - q, cy + q, cx + q, cy - q, c, t);
+    } else if (name == "search") {
+        game.circle(cx - 2, cy - 2, q + 2, c, false);
+        game.line(cx + q, cy + q, cx + h - 1, cy + h - 1, c, t);
+    } else if (name == "list") {
+        game.rect(cx - h + 1, cy - q - 1, s - 2, t, c);
+        game.rect(cx - h + 1, cy - 1, s - 2, t, c);
+        game.rect(cx - h + 1, cy + q - 1, s - 2, t, c);
+    } else if (name == "queue") {
+        game.rect(cx - h + 1, cy - q - 1, s - 8, t, c);
+        game.rect(cx - h + 1, cy - 1, s - 8, t, c);
+        game.rect(cx - h + 1, cy + q - 1, q + 2, t, c);
+        game.triangle(cx + 2, cy + 1, cx + 2, cy + h - 1, cx + h, cy + q + 3, c);
+    } else if (name == "note") {
+        game.circle(cx - q, cy + q, q, c);
+        game.rect(cx - q + q - 1, cy - h + 1, t, h + q, c);
+        game.line(cx + 1, cy - h + 1, cx + h - 1, cy - q, c, t);
+    } else if (name == "eq") {
+        game.rect(cx - h + 2, cy - h + 2, t, s - 4, c);
+        game.rect(cx - 1, cy - h + 2, t, s - 4, c);
+        game.rect(cx + h - 4, cy - h + 2, t, s - 4, c);
+        game.rect(cx - h, cy - q, q + 2, t + 1, c);
+        game.rect(cx - 4, cy + 1, q + 2, t + 1, c);
+        game.rect(cx + h - 7, cy - 2, q + 2, t + 1, c);
+    } else if (name == "wave") {
+        game.rect(cx - h + 1, cy - 2, t, 4, c);
+        game.rect(cx - h + 5, cy - q, t, q * 2, c);
+        game.rect(cx - h + 9, cy - h + 2, t, s - 4, c);
+        game.rect(cx - h + 13, cy - q - 2, t, q * 2 + 4, c);
+        game.rect(cx - h + 17, cy - 3, t, 6, c);
+    } else if (name == "gear") {
+        game.circle(cx, cy, h - 1, c, false);
+        game.circle(cx, cy, q - 1, c, false);
+        game.rect(cx - 1, cy - h - 1, t, 4, c);
+        game.rect(cx - 1, cy + h - 3, t, 4, c);
+        game.rect(cx - h - 1, cy - 1, 4, t, c);
+        game.rect(cx + h - 3, cy - 1, 4, t, c);
+    } else if (name == "disc") {
+        game.circle(cx, cy, h - 1, c, false);
+        game.circle(cx, cy, q - 1, c, false);
+        game.circle(cx, cy, 1, c);
+    } else if (name == "folder") {
+        game.rect(cx - h + 1, cy - q, q + 3, 3, c);
+        game.rect(cx - h + 1, cy - q + 3, s - 2, q + h - 3, c, false);
+    } else if (name == "trash") {
+        game.rect(cx - q - 1, cy - q + 1, q * 2 + 3, h + 1, c, false);
+        game.rect(cx - q - 3, cy - q - 1, q * 2 + 7, 2, c);
+        game.rect(cx - 2, cy - q - 3, 5, 2, c);
+    } else if (name == "up") {
+        game.triangle(cx - q, cy + 2, cx + q, cy + 2, cx, cy - q, c);
+    } else if (name == "down") {
+        game.triangle(cx - q, cy - 2, cx + q, cy - 2, cx, cy + q, c);
+    } else if (name == "left") {
+        game.triangle(cx + 2, cy - q, cx + 2, cy + q, cx - q, cy, c);
+    } else if (name == "right") {
+        game.triangle(cx - 2, cy - q, cx - 2, cy + q, cx + q, cy, c);
+    } else if (name == "clock") {
+        game.circle(cx, cy, h - 1, c, false);
+        game.line(cx, cy, cx, cy - q, c, 1);
+        game.line(cx, cy, cx + q - 1, cy + 2, c, 1);
+    } else if (name == "save") {
+        game.rect(cx - h + 2, cy - h + 2, s - 4, s - 4, c, false);
+        game.rect(cx - q, cy - h + 2, q * 2, q, c);
+        game.rect(cx - q, cy + 1, q * 2, q, c, false);
+    } else if (name == "score") {
+        game.rect(cx - h + 1, cy - q, s - 2, t, c);
+        game.rect(cx - h + 1, cy, s - 2, t, c);
+        game.rect(cx - h + 1, cy + q, s - 2, t, c);
+        game.circle(cx - 2, cy + 1, 3, c);
+        game.circle(cx + 5, cy - q + 1, 3, c);
+    } else {
+        game.rect(cx - q, cy - q, h, h, c, false);
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// buttons
+// ----------------------------------------------------------------------------------------------
+fn press(U, id, x, y, w, h) -> any {
+    let over = hit(U, x, y, w, h);
+    if (over && (U.active == "" || U.active == id)) { U.hot = id; }
+    if (over && U.pressed) { U.active = id; }
+    var clicked = false;
+    if (U.active == id && U.released) {
+        if (over) { clicked = true; }
+        U.active = "";
+    }
+    return clicked;
+}
+
+// style: "primary" | "normal" | "ghost" | "danger"
+fn button(U, id, x, y, w, h, label, style) -> any {
+    let T = U.T;
+    let clicked = press(U, id, x, y, w, h);
+    let over = U.hot == id;
+    let a = anim(U, id, over ? 1.0 : 0.0, 14.0);
+    var base = T.panel2;
+    var fg = T.text;
+    if (style == "primary") { base = T.accent; fg = T.dark ? 0x0b0b12 : 0xffffff; }
+    if (style == "danger") { base = T.bad; fg = 0xffffff; }
+    if (style == "ghost") { base = T.panel; }
+    var col = game.mix(base, T.text, 0.10 * a);
+    if (U.active == id) { col = game.mix(base, 0x000000, 0.18); }
+    if (style == "ghost") {
+        rrect_border(x, y, w, h, 6, col, 1, game.mix(T.line, T.accent, a));
+    } else {
+        rrect(x, y, w, h, 6, col);
+    }
+    let sc = h >= 34 ? 2 : 1;
+    let ty = y + idiv(h - 8 * sc, 2) + (U.active == id ? 1 : 0);
+    text_cb(x + idiv(w, 2), ty, fit(label, w - 10, sc), fg, sc);
+    return clicked;
+}
+
+fn icon_button(U, id, x, y, s, name, on, tip) -> any {
+    let T = U.T;
+    let clicked = press(U, id, x, y, s, s);
+    let over = U.hot == id;
+    let a = anim(U, id, over ? 1.0 : 0.0, 14.0);
+    if (a > 0.01) { rrect(x, y, s, s, idiv(s, 4) + 2, game.mix(T.panel, T.panel2, a)); }
+    var c = on ? T.accent : game.mix(T.dim, T.text, a);
+    if (U.active == id) { c = T.accent2; }
+    icon(name, x + idiv(s, 2), y + idiv(s, 2), idiv(s * 11, 20) + 4, c);
+    if (tip != "") { tooltip(U, x, y, s, s, tip); }
+    return clicked;
+}
+
+// big round transport button (play / pause)
+fn round_button(U, id, cx, cy, r, name, tip) -> any {
+    let T = U.T;
+    let clicked = press(U, id, cx - r, cy - r, r * 2, r * 2);
+    let a = anim(U, id, U.hot == id ? 1.0 : 0.0, 14.0);
+    disc(cx, cy, r + 3, game.mix(T.accent, T.bg, 0.55 - 0.3 * a));
+    disc(cx, cy, r, game.mix(T.accent, 0xffffff, 0.12 * a));
+    icon(name, cx + (name == "play" ? 2 : 0), cy, r, T.dark ? 0x0b0b12 : 0xffffff);
+    if (tip != "") { tooltip(U, cx - r, cy - r, r * 2, r * 2, tip); }
+    return clicked;
+}
+
+// pill chip (filters, presets). returns true when clicked
+fn chip(U, id, x, y, label, on) -> any {
+    let T = U.T;
+    let w = tw(label, 1) + 20;
+    let h = 24;
+    let clicked = press(U, id, x, y, w, h);
+    let a = anim(U, id, U.hot == id ? 1.0 : 0.0, 14.0);
+    if (on) {
+        rrect(x, y, w, h, 12, T.accent);
+        text_b(x + 10, y + 8, label, T.dark ? 0x0b0b12 : 0xffffff, 1);
+    } else {
+        rrect_border(x, y, w, h, 12, game.mix(T.panel, T.panel2, a), 1, game.mix(T.line, T.accent, a));
+        text(x + 10, y + 8, label, game.mix(T.dim, T.text, a), 1);
+    }
+    return clicked;
+}
+
+fn chip_w(label) -> any { return tw(label, 1) + 20; }
+
+fn toggle(U, id, x, y, on) -> any {
+    let T = U.T;
+    let w = 38;
+    let h = 20;
+    let clicked = press(U, id, x, y, w, h);
+    let a = anim(U, id + "/k", on ? 1.0 : 0.0, 16.0);
+    rrect(x, y, w, h, 10, game.mix(T.line, T.accent, a));
+    disc(x + 10 + int(18 * a), y + 10, 7, 0xffffff);
+    return clicked;
+}
+
+// segmented control: returns the selected index
+fn segmented(U, id, x, y, w, h, labels, sel) -> any {
+    let T = U.T;
+    let n = len(labels);
+    let cw = idiv(w, n);
+    rrect(x, y, w, h, 6, T.panel2);
+    var out = sel;
+    for (i in 0..n) {
+        let bx = x + i * cw;
+        let bid = id + "/" + i;
+        if (press(U, bid, bx, y, cw, h)) { out = i; U.changed = true; }
+        let a = anim(U, bid, U.hot == bid ? 1.0 : 0.0, 14.0);
+        if (i == sel) { rrect(bx + 2, y + 2, cw - 4, h - 4, 5, T.accent); }
+        var fg = i == sel ? (T.dark ? 0x0b0b12 : 0xffffff) : game.mix(T.dim, T.text, a);
+        text_cb(bx + idiv(cw, 2), y + idiv(h - 8, 2), fit(labels[i], cw - 6, 1), fg, 1);
+    }
+    return out;
+}
+
+// ----------------------------------------------------------------------------------------------
+// sliders
+// ----------------------------------------------------------------------------------------------
+fn slider(U, id, x, y, w, v, lo, hi) -> any {
+    let T = U.T;
+    let over = hit(U, x - 6, y - 9, w + 12, 20);
+    if (over && (U.active == "" || U.active == id)) { U.hot = id; }
+    if (over && U.pressed) { U.active = id; }
+    var out = v;
+    if (U.active == id) {
+        if (U.down) {
+            out = lo + clamp((U.mx - x) / (w * 1.0), 0.0, 1.0) * (hi - lo);
+            U.changed = true;
+        } else {
+            U.active = "";
+            U.drag_end = id;
+        }
+    }
+    if (over && U.wheel != 0 && U.active == "") {
+        out = clamp(out + U.wheel * (hi - lo) * 0.03, lo, hi);
+        U.changed = true;
+    }
+    let f = (out - lo) / ((hi - lo) * 1.0);
+    let a = anim(U, id + "/h", (U.hot == id || U.active == id) ? 1.0 : 0.0, 14.0);
+    rrect(x, y - 3, w, 6, 3, T.line);
+    if (f > 0.0) { rrect(x, y - 3, max(6, int(w * f)), 6, 3, T.accent); }
+    disc(x + int(w * f), y, 7 + int(2 * a), T.dark ? 0xffffff : T.accent);
+    return out;
+}
+
+fn vslider(U, id, x, y, h, v, lo, hi, zero_mark) -> any {
+    let T = U.T;
+    let over = hit(U, x - 12, y - 8, 24, h + 16);
+    if (over && (U.active == "" || U.active == id)) { U.hot = id; }
+    if (over && U.pressed) { U.active = id; }
+    var out = v;
+    if (U.active == id) {
+        if (U.down) {
+            out = hi - clamp((U.my - y) / (h * 1.0), 0.0, 1.0) * (hi - lo);
+            U.changed = true;
+        } else {
+            U.active = "";
+            U.drag_end = id;
+        }
+    }
+    if (over && U.wheel != 0 && U.active == "") {
+        out = clamp(out + U.wheel * (hi - lo) * 0.04, lo, hi);
+        U.changed = true;
+    }
+    if (U.dbl && over) { out = zero_mark; U.changed = true; }
+    let f = (out - lo) / ((hi - lo) * 1.0);
+    let ky = y + h - int(h * f);
+    let zf = (zero_mark - lo) / ((hi - lo) * 1.0);
+    let zy = y + h - int(h * zf);
+    let a = anim(U, id + "/h", (U.hot == id || U.active == id) ? 1.0 : 0.0, 14.0);
+    rrect(x - 3, y, 6, h, 3, T.line);
+    game.rect(x - 9, zy, 18, 1, T.dim);
+    if (ky < zy) { rrect(x - 3, ky, 6, zy - ky + 1, 2, T.accent); } else { rrect(x - 3, zy, 6, ky - zy + 1, 2, T.accent2); }
+    disc(x, ky, 8 + int(2 * a), T.dark ? 0xffffff : T.accent);
+    return out;
+}
+
+// drag along an x-range (seek bars). returns fraction 0..1 while dragging, else -1.0.
+// On the release frame U.drag_end == id and U.drag_f holds the final fraction.
+fn drag_x(U, id, x, y, w, h) -> any {
+    let over = hit(U, x, y, w, h);
+    if (over && (U.active == "" || U.active == id)) { U.hot = id; }
+    if (over && U.pressed) { U.active = id; }
+    if (U.active == id) {
+        let f = clamp((U.mx - x) / (w * 1.0), 0.0, 1.0);
+        if (U.down) {
+            U.drag_f = f;
+            return f;
+        }
+        U.active = "";
+        U.drag_end = id;
+        U.drag_f = f;
+        return f;
+    }
+    return -1.0;
+}
+
+// ----------------------------------------------------------------------------------------------
+// text input
+// ----------------------------------------------------------------------------------------------
+fn text_input(U, id, x, y, w, h, value, placeholder) -> any {
+    let T = U.T;
+    let over = hit(U, x, y, w, h);
+    if (over && U.pressed) { U.focus = id; U.caret_t = 0.0; }
+    if (over) { U.text_hit = true; }
+    var out = value;
+    let focused = U.focus == id;
+    if (focused) {
+        let tp = U.typed;
+        if (len(tp) > 0) {
+            var add = "";
+            for (c in tp) { let ch = ord(c); if (ch >= 32 && ch < 127) { add = add + chr(ch); } }
+            if (len(add) > 0) { out = out + add; U.changed = true; U.caret_t = 0.0; }
+        }
+        let held = game.key("backspace");
+        if (game.key_pressed("backspace")) {
+            U.bs_t = U.t + 0.4;
+            if (game.key("ctrl")) { out = ""; } else if (len(out) > 0) { out = out[0..len(out) - 1]; }
+            U.changed = true;
+        } else if (held && U.t > U.bs_t) {
+            U.bs_t = U.t + 0.035;
+            if (len(out) > 0) { out = out[0..len(out) - 1]; U.changed = true; }
+        }
+        if (game.key_pressed("enter")) { U.submit = id; }
+        if (game.key_pressed("escape")) { if (len(out) > 0) { out = ""; U.changed = true; } else { U.focus = ""; } }
+    }
+    let a = anim(U, id, (over || focused) ? 1.0 : 0.0, 12.0);
+    rrect_border(x, y, w, h, 6, T.panel2, 1, focused ? T.accent : game.mix(T.line, T.dim, a * 0.5));
+    let sc = h >= 44 ? 2 : 1;
+    let ty = y + idiv(h - 8 * sc, 2);
+    let maxw = w - 18;
+    if (len(out) == 0 && !focused) {
+        text_fit(x + 9, ty, maxw, placeholder, T.dim, sc);
+    } else {
+        var shown = out;
+        var guard = 0;
+        while (tw(shown, sc) > maxw && len(shown) > 1 && guard < 400) { shown = shown[1..len(shown)]; guard += 1; }
+        text(x + 9, ty, shown, T.text, sc);
+        if (focused && int(U.caret_t * 2.0) % 2 == 0) { game.rect(x + 10 + tw(shown, sc), ty - 1, 2, 8 * sc + 2, T.accent); }
+    }
+    return out;
+}
+
+// ----------------------------------------------------------------------------------------------
+// scroll area: handles the wheel and a draggable scrollbar; returns the current offset in pixels
+// ----------------------------------------------------------------------------------------------
+fn scroll(U, id, x, y, w, h, content_h) -> any {
+    let T = U.T;
+    var off = 0.0;
+    if (id in U.scr) { off = U.scr[id]; }
+    let maxo = max(0, content_h - h) * 1.0;
+    if (hit(U, x, y, w, h) && U.wheel != 0) { off -= U.wheel * 54.0; }
+    if (maxo > 0.0) {
+        let tw_ = 8;
+        let tx = x + w - tw_ - 3;
+        let th = max(34, int(h * h / (content_h * 1.0)));
+        let ty = y + int((h - th) * off / maxo);
+        let over = hit(U, tx - 5, y, tw_ + 10, h);
+        if (over && U.pressed) {
+            U.active = id + "/sb";
+            if (U.my >= ty && U.my < ty + th) { U.grab = U.my - ty * 1.0; } else { U.grab = th / 2.0; }
+        }
+        if (U.active == id + "/sb") {
+            if (U.down) { off = clamp((U.my - U.grab - y) / ((h - th) * 1.0), 0.0, 1.0) * maxo; } else { U.active = ""; }
+        }
+        let ty2 = y + int((h - th) * clamp(off / maxo, 0.0, 1.0));
+        let a = anim(U, id + "/sb", (over || U.active == id + "/sb") ? 1.0 : 0.0, 12.0);
+        rrect(tx, y + 2, tw_, h - 4, 4, game.mix(T.panel, T.panel2, 0.5 + 0.5 * a));
+        rrect(tx, ty2 + 2, tw_, th - 4, 4, game.mix(T.dim, T.accent, a));
+    }
+    off = clamp(off, 0.0, maxo);
+    U.scr[id] = off;
+    return int(off);
+}
+
+fn scroll_to(U, id, y) {
+    U.scr[id] = y * 1.0;
+}
+
+// ----------------------------------------------------------------------------------------------
+// context menu / tooltip / toast overlays
+// ----------------------------------------------------------------------------------------------
+// items: array of strings. "-" is a separator, a leading "!" makes an item disabled.
+fn menu_open(U, x, y, items, tag) {
+    var w = 120;
+    for (it in items) { w = max(w, tw(it, 1) + 40); }
+    var h = 8;
+    for (it in items) { h += it == "-" ? 9 : 26; }
+    var px = x;
+    var py = y;
+    if (px + w > U.W - 6) { px = U.W - w - 6; }
+    if (py + h > U.H - 6) { py = U.H - h - 6; }
+    U.menu = { x: px, y: py, w: w, h: h, items: items, tag: tag, t0: U.t };
+}
+
+// result of a menu: returns null or { tag, index, label } (consumed)
+fn take_choice(U, tag) -> any {
+    let c = U.choice;
+    if (c != null && c.tag == tag) { U.choice = null; return c; }
+    return null;
+}
+
+fn draw_menu(U) -> any {
+    let m = U.menu;
+    if (m == null) { return 0; }
+    let T = U.T;
+    shadow(m.x, m.y, m.w, m.h, 8);
+    rrect_border(m.x, m.y, m.w, m.h, 8, T.panel, 1, T.line);
+    var yy = m.y + 4;
+    var pick = -1;
+    let inside_menu = U.mx >= m.x && U.my >= m.y && U.mx < m.x + m.w && U.my < m.y + m.h;
+    for (i in 0..len(m.items)) {
+        let it = m.items[i];
+        if (it == "-") {
+            hline(m.x + 8, yy + 4, m.w - 16, T.line);
+            yy += 9;
+        } else {
+            let dis = it[0] == "!";
+            let label = dis ? it[1..len(it)] : it;
+            let over = inside_menu && U.my >= yy && U.my < yy + 26 && !dis;
+            if (over) { rrect(m.x + 4, yy, m.w - 8, 26, 5, T.accent); }
+            text(m.x + 16, yy + 9, label, over ? (T.dark ? 0x0b0b12 : 0xffffff) : (dis ? T.dim : T.text), 1);
+            if (over && U.pressed && U.t - m.t0 > 0.05) { pick = i; }
+            yy += 26;
+        }
+    }
+    if (pick >= 0) {
+        U.choice = { tag: m.tag, index: pick, label: m.items[pick] };
+        U.menu = null;
+        U.pressed = false;
+    } else if ((U.pressed || U.rpressed) && !inside_menu && U.t - m.t0 > 0.05) {
+        U.menu = null;
+    } else if (game.key_pressed("escape")) {
+        U.menu = null;
+    }
+}
+
+fn tooltip(U, x, y, w, h, s) -> any {
+    if (U.lock || U.down) { return 0; }
+    if (inside(U, x, y, w, h)) {
+        U.tip_cand = s;
+        U.tip_x = x;
+        U.tip_y = y;
+        U.tip_w = w;
+        U.tip_h = h;
+    }
+}
+
+fn draw_tooltip(U) -> any {
+    if (U.tip_cand == "") { U.tip_prev = ""; U.tip_t = 0.0; return 0; }
+    if (U.tip_cand != U.tip_prev) { U.tip_prev = U.tip_cand; U.tip_t = 0.0; return 0; }
+    U.tip_t += U.dt;
+    if (U.tip_t < 0.45) { return 0; }
+    let T = U.T;
+    let w = tw(U.tip_cand, 1) + 18;
+    var px = U.tip_x + idiv(U.tip_w, 2) - idiv(w, 2);
+    var py = U.tip_y - 28;
+    if (py < 4) { py = U.tip_y + U.tip_h + 6; }
+    if (px < 4) { px = 4; }
+    if (px + w > U.W - 4) { px = U.W - w - 4; }
+    shadow(px, py, w, 22, 5);
+    rrect_border(px, py, w, 22, 5, T.panel2, 1, T.line);
+    text(px + 8, py + 7, U.tip_cand, T.text, 1);
+}
+
+fn draw_toasts(U) {
+    let T = U.T;
+    var keep = [];
+    var yy = U.H - 150;
+    for (i in 0..len(U.toasts)) {
+        let ts = U.toasts[i];
+        let age = U.t - ts.t0;
+        if (age < 3.0) {
+            push(keep, ts);
+            let a = clamp(min(age / 0.2, (3.0 - age) / 0.4), 0.0, 1.0);
+            let w = tw(ts.text, 1) + 40;
+            let x = idiv(U.W - w, 2) + 100;
+            let off = int((1.0 - a) * 14);
+            shadow(x, yy + off, w, 30, 15);
+            rrect_border(x, yy + off, w, 30, 15, game.mix(T.bg, T.panel2, a), 1, game.mix(T.bg, T.accent, a));
+            text(x + 18, yy + 11 + off, ts.text, game.mix(T.panel2, T.text, a), 1);
+            yy -= 38;
+        }
+    }
+    U.toasts = keep;
+}
+
+// ----------------------------------------------------------------------------------------------
+// small reusable bits
+// ----------------------------------------------------------------------------------------------
+// animated equaliser glyph shown next to the playing row
+fn playing_bars(x, y, t, c, on) {
+    for (i in 0..3) {
+        var hh = 3;
+        if (on) { hh = 3 + int(7 * (0.5 + 0.5 * sin(t * (6.0 + i * 2.3) + i * 1.7))); }
+        game.rect(x + i * 5, y + 12 - hh, 3, hh, c);
+    }
+}
+
+// procedural album art: seed picks hue + pattern, `pulse` (0..1) makes it breathe with the beat
+fn cover(x, y, s, seed, pulse, T) {
+    let hue = ((seed * 37) % 360) / 360.0;
+    let c1 = game.hsv(hue, 0.65, 0.85);
+    let c2 = game.hsv(hue + 0.12 - floor(hue + 0.12), 0.75, 0.35);
+    let c3 = game.hsv(hue + 0.5 - floor(hue + 0.5), 0.6, 0.95);
+    game.clip(x, y, s, s);
+    game.rect_grad(x, y, s, s, c1, c2);
+    let kind = seed % 4;
+    let cx = x + idiv(s, 2);
+    let cy = y + idiv(s, 2);
+    if (kind == 0) {
+        game.circle(cx, cy, int(s * (0.30 + 0.04 * pulse)), c3, false);
+        game.circle(cx, cy, int(s * 0.18), c3);
+        game.circle(cx, cy, int(s * 0.46), c2, false);
+    } else if (kind == 1) {
+        for (i in 0..6) { game.rect(x, y + int(s * (0.1 + i * 0.15)), s, max(2, int(s * (0.04 + 0.02 * pulse))), c3); }
+    } else if (kind == 2) {
+        game.triangle(x + 2, y + s - 2, x + s - 2, y + s - 2, cx, y + int(s * 0.18), c3);
+        game.triangle(x + int(s * 0.3), y + s - 2, x + int(s * 0.8), y + s - 2, x + int(s * 0.6), y + int(s * 0.5), c2);
+    } else {
+        for (i in 0..5) { game.circle(x + int(s * (0.15 + i * 0.17)), cy + int(s * 0.18 * sin(seed + i * 1.3)), int(s * (0.07 + 0.015 * pulse)), c3); }
+    }
+    game.clip();
+}

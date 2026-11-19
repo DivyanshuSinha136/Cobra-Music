@@ -1,0 +1,243 @@
+// readme_assets.kc — generates the SVG artwork used by README.md (banner, badges, architecture diagram, coloured
+// feature icons, dividers). All text is converted to vector OUTLINES with src/ttf.kc, so the SVGs look identical
+// everywhere and need no web fonts.
+//   kingcobra run tools/readme_assets.kc            (writes into docs/img/)
+import std.system;
+import std.io;
+import "../src/ttf.kc" as ttf;
+
+const ACCENT = "#4f8cff";
+const TEAL = "#35e0c2";
+const INK = "#0b1020";
+
+fn num(v) -> any { return sprintf("%.1f", v); }
+
+// ---------------------------------------------------------------------------------------------
+// text -> SVG path outlines
+// ---------------------------------------------------------------------------------------------
+fn contour_d(contour, s, ox, oy) -> any {
+    let n = len(contour);
+    if (n < 2) { return ""; }
+    var si = -1;
+    for (i in 0..n) { if (contour[i][2]) { si = i; break; } }
+    var order = [];
+    var sx = 0.0; var sy = 0.0;
+    if (si >= 0) {
+        for (k in 0..n) { push(order, contour[(si + k) % n]); }
+        sx = order[0][0]; sy = order[0][1];
+    } else {
+        sx = (contour[0][0] + contour[1][0]) / 2.0; sy = (contour[0][1] + contour[1][1]) / 2.0;
+        order = [[sx, sy, true]];
+        for (k in 0..n) { push(order, contour[(1 + k) % n]); }
+    }
+    var d = "M" + num(ox + sx * s) + " " + num(oy - sy * s);
+    let m = len(order);
+    var i = 1;
+    while (i <= m) {
+        let pt = order[i % m];
+        if (pt[2]) {
+            d = d + "L" + num(ox + pt[0] * s) + " " + num(oy - pt[1] * s);
+            i += 1;
+        } else {
+            let nx = order[(i + 1) % m];
+            var ex = nx[0]; var ey = nx[1];
+            if (!nx[2]) { ex = (pt[0] + nx[0]) / 2.0; ey = (pt[1] + nx[1]) / 2.0; i += 1; } else { i += 2; }
+            d = d + "Q" + num(ox + pt[0] * s) + " " + num(oy - pt[1] * s) + " " + num(ox + ex * s) + " " + num(oy - ey * s);
+        }
+    }
+    return d + "Z";
+}
+
+// cp list of an ASCII/UTF-8 string
+fn codepoints(str) -> any {
+    let b = buffer_from(str);
+    var out = [];
+    var i = 0;
+    let n = len(str);
+    while (i < n) {
+        let c = b.get_u8(i);
+        if (c < 128) { push(out, c); i += 1; }
+        else if (c >= 0xC0 && c < 0xE0) { push(out, ((c & 0x1F) << 6) | (b.get_u8(i + 1) & 0x3F)); i += 2; }
+        else if (c >= 0xE0 && c < 0xF0) { push(out, ((c & 0x0F) << 12) | ((b.get_u8(i + 1) & 0x3F) << 6) | (b.get_u8(i + 2) & 0x3F)); i += 3; }
+        else { push(out, 63); i += 1; }
+    }
+    b.free();
+    return out;
+}
+
+fn text_width(F, str, px, track) -> any {
+    var w = 0.0;
+    for (cp in codepoints(str)) { w += ttf.advance(F, ttf.glyph_index(F, cp)) * px / F.upm + track; }
+    return w;
+}
+
+// one <path> element for the whole string (fill rule non-zero), baseline at y
+fn text_path(F, str, px, x, y, track, fill) -> any {
+    let s = px / (F.upm * 1.0);
+    var d = "";
+    var pen = x * 1.0;
+    for (cp in codepoints(str)) {
+        let gid = ttf.glyph_index(F, cp);
+        let ol = ttf.outline(F, gid, 0);
+        for (ct in ol.contours) { d = d + contour_d(ct, s, pen, y); }
+        pen += ttf.advance(F, gid) * s + track;
+    }
+    return "<path fill=\"" + fill + "\" d=\"" + d + "\"/>";
+}
+
+fn svg_open(w, h, title) -> any {
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w + "\" height=\"" + h + "\" viewBox=\"0 0 " + w + " " + h + "\" role=\"img\" aria-label=\"" + title + "\"><title>" + title + "</title>\n";
+}
+
+// ---------------------------------------------------------------------------------------------
+// banner
+// ---------------------------------------------------------------------------------------------
+fn banner(fonts, logo_d) -> any {
+    let bold = fonts.bold;
+    let reg = fonts.reg;
+    let disp = fonts.disp;
+    var s = svg_open(1280, 360, "Cobra Music Studio - a music player and production studio written in KingCobra");
+    s = s + "<defs>\n";
+    s = s + "<linearGradient id=\"bg\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0\" stop-color=\"#0a0f1e\"/><stop offset=\"1\" stop-color=\"#1a2552\"/></linearGradient>\n";
+    s = s + "<radialGradient id=\"g1\" cx=\"0.12\" cy=\"0.15\" r=\"0.6\"><stop offset=\"0\" stop-color=\"" + ACCENT + "\" stop-opacity=\"0.38\"/><stop offset=\"1\" stop-color=\"" + ACCENT + "\" stop-opacity=\"0\"/></radialGradient>\n";
+    s = s + "<radialGradient id=\"g2\" cx=\"0.92\" cy=\"1\" r=\"0.55\"><stop offset=\"0\" stop-color=\"" + TEAL + "\" stop-opacity=\"0.32\"/><stop offset=\"1\" stop-color=\"" + TEAL + "\" stop-opacity=\"0\"/></radialGradient>\n";
+    s = s + "<linearGradient id=\"badge\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0\" stop-color=\"" + ACCENT + "\"/><stop offset=\"1\" stop-color=\"" + TEAL + "\"/></linearGradient>\n";
+    s = s + "<linearGradient id=\"bar\" x1=\"0\" y1=\"1\" x2=\"0\" y2=\"0\"><stop offset=\"0\" stop-color=\"" + ACCENT + "\" stop-opacity=\"0.15\"/><stop offset=\"1\" stop-color=\"" + TEAL + "\"/></linearGradient>\n";
+    s = s + "<clipPath id=\"round\"><rect width=\"1280\" height=\"360\" rx=\"20\"/></clipPath>\n</defs>\n";
+    s = s + "<g clip-path=\"url(#round)\">\n<rect width=\"1280\" height=\"360\" fill=\"url(#bg)\"/>\n<rect width=\"1280\" height=\"360\" fill=\"url(#g1)\"/>\n<rect width=\"1280\" height=\"360\" fill=\"url(#g2)\"/>\n";
+    // decorative equaliser on the right
+    for (i in 0..24) {
+        let h = 36.0 + 84.0 * (0.5 + 0.5 * sin(i * 0.55 + 1.0)) * (0.55 + 0.45 * cos(i * 0.21));
+        s = s + "<rect x=\"" + num(880 + i * 15.0) + "\" y=\"" + num(330 - h) + "\" width=\"9\" height=\"" + num(h) + "\" rx=\"4.5\" fill=\"url(#bar)\" opacity=\"0.85\"/>\n";
+    }
+    s = s + "</g>\n";
+    // logo badge
+    s = s + "<circle cx=\"128\" cy=\"128\" r=\"74\" fill=\"" + ACCENT + "\" opacity=\"0.18\"/>\n<circle cx=\"128\" cy=\"128\" r=\"62\" fill=\"url(#badge)\"/>\n";
+    s = s + "<g transform=\"translate(96 94) scale(2.7)\"><path fill-rule=\"evenodd\" fill=\"" + INK + "\" d=\"" + logo_d + "\"/></g>\n";
+    // title + tagline
+    s = s + text_path(disp, "Cobra Music Studio", 74, 232, 142, 0.0, "#ffffff") + "\n";
+    s = s + text_path(reg, "A music player and production studio, written entirely in KingCobra.", 25, 234, 188, 0.0, "#a9b8e6") + "\n";
+    // pills
+    var x = 234.0;
+    for (p in ["Player", "Studio", "Visualizer", "Equalizer", "SVG UI"]) {
+        let w = text_width(bold, p, 15, 0.4) + 34.0;
+        s = s + "<rect x=\"" + num(x) + "\" y=\"222\" width=\"" + num(w) + "\" height=\"36\" rx=\"18\" fill=\"#ffffff\" fill-opacity=\"0.07\" stroke=\"#ffffff\" stroke-opacity=\"0.22\"/>\n";
+        s = s + text_path(bold, p, 15, x + 17.0, 245, 0.4, "#e7edff") + "\n";
+        x += w + 12.0;
+    }
+    s = s + text_path(bold, "NO std.gui  -  OWN WIDGET TOOLKIT  -  SVG ICONS  -  TRUETYPE FONTS", 12, 236, 306, 1.6, "#6f80b8") + "\n";
+    return s + "</svg>\n";
+}
+
+// ---------------------------------------------------------------------------------------------
+// badges (flat, 22 px)
+// ---------------------------------------------------------------------------------------------
+fn badge(F, label, value, color) -> any {
+    let lw = text_width(F, label, 11, 0.3) + 18.0;
+    let vw = text_width(F, value, 11, 0.3) + 18.0;
+    let w = lw + vw;
+    var s = svg_open(int(ceil(w)), 22, label + ": " + value);
+    s = s + "<clipPath id=\"c\"><rect width=\"" + num(w) + "\" height=\"22\" rx=\"5\"/></clipPath><g clip-path=\"url(#c)\">";
+    s = s + "<rect width=\"" + num(lw) + "\" height=\"22\" fill=\"#1b2542\"/><rect x=\"" + num(lw) + "\" width=\"" + num(vw) + "\" height=\"22\" fill=\"" + color + "\"/></g>";
+    s = s + text_path(F, label, 11, 9, 15, 0.3, "#c9d4f5");
+    s = s + text_path(F, value, 11, lw + 9.0, 15, 0.3, "#0b1020");
+    return s + "</svg>\n";
+}
+
+// ---------------------------------------------------------------------------------------------
+// architecture diagram
+// ---------------------------------------------------------------------------------------------
+fn box(fonts, x, y, w, h, title, sub, color) -> any {
+    var s = "<rect x=\"" + x + "\" y=\"" + y + "\" width=\"" + w + "\" height=\"" + h + "\" rx=\"12\" fill=\"#131b33\" stroke=\"" + color + "\" stroke-width=\"1.6\"/>\n";
+    s = s + "<rect x=\"" + x + "\" y=\"" + y + "\" width=\"6\" height=\"" + h + "\" rx=\"3\" fill=\"" + color + "\"/>\n";
+    s = s + text_path(fonts.bold, title, 17, x + 22, y + 28, 0.0, "#f1f5ff") + "\n";
+    var yy = y + 50;
+    for (ln in sub) {
+        s = s + text_path(fonts.reg, ln, 13, x + 22, yy, 0.0, "#9fb0e0") + "\n";
+        yy += 18;
+    }
+    return s;
+}
+
+fn arrow(x1, y1, x2, y2) -> any {
+    let up = y2 < y1;
+    var s = "<path d=\"M" + x1 + " " + y1 + "L" + x2 + " " + (up ? y2 + 7 : y2 - 7) + "\" stroke=\"#51608f\" stroke-width=\"2\" fill=\"none\"/>";
+    if (up) { s = s + "<path d=\"M" + (x2 - 6) + " " + (y2 + 8) + "L" + x2 + " " + y2 + "L" + (x2 + 6) + " " + (y2 + 8) + "z\" fill=\"#51608f\"/>"; }
+    else { s = s + "<path d=\"M" + (x2 - 6) + " " + (y2 - 8) + "L" + x2 + " " + y2 + "L" + (x2 + 6) + " " + (y2 - 8) + "z\" fill=\"#51608f\"/>"; }
+    return s + "\n";
+}
+
+fn architecture(fonts) -> any {
+    var s = svg_open(1100, 620, "Architecture of Cobra Music Studio");
+    s = s + "<rect width=\"1100\" height=\"620\" rx=\"18\" fill=\"#0b1020\"/>\n";
+    s = s + text_path(fonts.disp, "Architecture", 26, 32, 48, 0.0, "#ffffff") + "\n";
+    s = s + box(fonts, 32, 70, 1036, 84, "Screens", ["views.kc  Library, Playlists, Queue, player bar     views2.kc  Visualizer, Equalizer, Score, Settings     views3.kc  Studio"], ACCENT);
+    s = s + arrow(550, 154, 550, 186);
+    s = s + box(fonts, 32, 186, 1036, 84, "Application", ["app.kc  frame loop, shortcuts, crash guard     core.kc  state, queue, shuffle/repeat, sleep timer, prefetch, autosave"], TEAL);
+    s = s + arrow(180, 270, 180, 302) + arrow(430, 270, 430, 302) + arrow(680, 270, 680, 302) + arrow(930, 270, 930, 302);
+    s = s + box(fonts, 32, 302, 238, 118, "Engine", ["DSP chain, 10-band EQ", "transport clock", "player child process", "loudness match, cache"], "#ff7ab6");
+    s = s + box(fonts, 292, 302, 238, 118, "Library", ["catalogue + folder scan", "search, sort, playlists", "JSON state, sanitising"], "#ffc24a");
+    s = s + box(fonts, 552, 302, 238, 118, "Studio", ["project model, undo", "notation compiler", "sidechain, sampler, stems", "WAV / MIDI / .kcm export"], "#b58cff");
+    s = s + box(fonts, 812, 302, 256, 118, "Visualizers", ["FFT bars, scope, radial", "waterfall, rings, VU", "piano roll, waveform bar"], "#5cd6ff");
+    s = s + arrow(550, 420, 550, 452);
+    s = s + box(fonts, 32, 452, 1036, 72, "UI toolkit  (ui.kc)", ["immediate-mode widgets: buttons, sliders, text input, scroll areas, menus, tooltips, toasts"], ACCENT);
+    s = s + arrow(550, 524, 550, 546);
+    s = s + box(fonts, 32, 546, 500, 56, "Graphics  (vec.kc, ttf.kc, gfx.kc)", ["SVG rasteriser, TrueType parser, texture atlas"], TEAL);
+    s = s + box(fonts, 552, 546, 516, 56, "KingCobra standard library", ["std.game 2D + input     std.music_note     std.system     std.json"], "#8a98c4");
+    return s + "</svg>\n";
+}
+
+// ---------------------------------------------------------------------------------------------
+// coloured feature icons (re-tint the shipped SVG icons)
+// ---------------------------------------------------------------------------------------------
+fn tinted_icon(src_path, color) -> any {
+    var t = io.read_file(src_path);
+    t = t.replace("#000", color);
+    return t;
+}
+
+fn divider() -> any {
+    var s = svg_open(1280, 4, "divider");
+    s = s + "<defs><linearGradient id=\"d\" x1=\"0\" x2=\"1\"><stop offset=\"0\" stop-color=\"" + ACCENT + "\" stop-opacity=\"0\"/><stop offset=\"0.5\" stop-color=\"" + ACCENT + "\"/><stop offset=\"1\" stop-color=\"" + TEAL + "\" stop-opacity=\"0\"/></linearGradient></defs>";
+    return s + "<rect width=\"1280\" height=\"3\" rx=\"1.5\" fill=\"url(#d)\"/></svg>\n";
+}
+
+fn main() {
+    let root = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+    let fd = system.path_join(root, "assets", "fonts");
+    let fonts = {
+        reg: ttf.load(system.path_join(fd, "InstrumentSans-Regular.ttf")),
+        bold: ttf.load(system.path_join(fd, "InstrumentSans-Bold.ttf")),
+        disp: ttf.load(system.path_join(fd, "Outfit-Bold.ttf"))
+    };
+    let out = system.path_join(root, "docs", "img");
+    system.mkdir(system.path_join(out, "icons"), true);
+    system.mkdir(system.path_join(out, "badges"), true);
+    // logo path from the shipped logo.svg
+    let logo = io.read_file(system.path_join(root, "assets", "icons", "logo.svg"));
+    let a = logo.index_of(" d=\"");
+    let rest = logo[a + 4..len(logo)];
+    let logo_d = rest[0..rest.index_of("\"")];
+    io.write_file(system.path_join(out, "banner.svg"), banner(fonts, logo_d));
+    io.write_file(system.path_join(out, "architecture.svg"), architecture(fonts));
+    io.write_file(system.path_join(out, "divider.svg"), divider());
+    let badges = [["language", "KingCobra", ACCENT], ["GUI toolkit", "custom, no std.gui", TEAL], ["icons", "SVG", "#ff7ab6"], ["fonts", "TrueType", "#ffc24a"],
+                  ["tests", "4 suites passing", "#7ddc8c"], ["platform", "Linux / Windows", "#b58cff"]];
+    for (b in badges) {
+        io.write_file(system.path_join(out, "badges", lib_slug(b[0]) + ".svg"), badge(fonts.bold, b[0], b[1], b[2]));
+    }
+    var n = 0;
+    for (f in system.list_dir(system.path_join(root, "assets", "icons"))) {
+        if (system.extension(f) == ".svg" && f != "logo.svg") {
+            io.write_file(system.path_join(out, "icons", f), tinted_icon(system.path_join(root, "assets", "icons", f), ACCENT));
+            n += 1;
+        }
+    }
+    print("wrote banner, architecture, divider,", len(badges), "badges,", n, "icons to", out);
+}
+
+fn lib_slug(s) -> any {
+    var o = "";
+    for (c in s) { o = o + (c == " " ? "-" : c); }
+    return o;
+}

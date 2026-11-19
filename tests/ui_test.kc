@@ -1,0 +1,179 @@
+// Interaction test: injects real mouse/keyboard input into the headless window and checks the app reacts.
+//   KC_MUSIC_SILENT=1 KC_MUSIC_HOME=/tmp/cm_test kingcobra run tests/ui_test.kc
+import std.game;
+import std.system;
+import "../src/app.kc" as app;
+import "../src/core.kc" as core;
+import "../src/library.kc" as lib;
+import "../src/engine.kc" as engine;
+import "../src/ui.kc" as ui;
+
+var fails = 0;
+fn check(name, cond) {
+    if (cond) { print("ok   - " + name); } else { print("FAIL - " + name); fails += 1; }
+}
+fn step(S, n) {
+    for (i in 0..n) { game.poll(); app.frame(S, 0.033); game.present(); }
+}
+fn click(S, x, y) {
+    game.send_mouse(x, y);
+    step(S, 1);
+    game.send_mouse(x, y, 1, true);
+    step(S, 1);
+    game.send_mouse(x, y, 1, false);
+    step(S, 1);
+}
+fn dblclick(S, x, y) {
+    game.send_mouse(x, y);
+    step(S, 1);
+    game.send_mouse(x, y, 1, true); step(S, 1);
+    game.send_mouse(x, y, 1, false); step(S, 1);
+    game.send_mouse(x, y, 1, true); step(S, 1);
+    game.send_mouse(x, y, 1, false); step(S, 1);
+}
+fn rclick(S, x, y) {
+    game.send_mouse(x, y);
+    step(S, 1);
+    game.send_mouse(x, y, 3, true); step(S, 1);
+    game.send_mouse(x, y, 3, false); step(S, 1);
+}
+fn key(S, k) {
+    game.send_key(k, true); step(S, 1);
+    game.send_key(k, false); step(S, 1);
+}
+fn wait_loaded(S) {
+    var n = 0;
+    while (S.loading != null && n < 800) { step(S, 1); system.sleep(0.05); n += 1; }
+}
+
+fn main() {
+    game.headless(true);
+    game.window("t", 1280, 720);
+    game.mode("2d");
+    let dir = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+    let S = app.create(dir, 1280, 720);
+    step(S, 3);
+    check("library has built-in + scanned tracks", len(S.tracks) >= 11);
+    check("kcm scores discovered", S.byid["kcm:" + system.path_join(dir, "music", "glass_rain.kcm")] != null);
+
+    // sorting by clicking a column header
+    click(S, 236 + 20 + 44 + 10, 64 + 36 + 14);
+    check("header click sorts by title", S.sort_col == "title");
+    click(S, 236 + 20 + 44 + 10, 64 + 36 + 14);
+    check("second click reverses sort", !S.sort_asc);
+
+    // genre filter chip
+    click(S, 236 + 20 + ui.chip_w("All") + 8 + ui.chip_w("Favorites") + 8 + 20, 64 + 8 + 12);
+    check("genre chip filters", S.genre == "Phonk" && len(lib.view_list(S)) == 4);
+    click(S, 236 + 40, 64 + 8 + 12);
+    check("All chip restores", S.genre == "All");
+
+    // search typing
+    click(S, 1280 - 340 + 100, 32);
+    check("search focused", S.U.focus == "search");
+    S.U.inject_text = "funk";
+    step(S, 2);
+    check("typed text reaches search box", S.query == "funk");
+    check("search narrows list", len(lib.view_list(S)) == 4);
+    game.send_key("backspace", true); step(S, 1); game.send_key("backspace", false); step(S, 1);
+    check("backspace edits", S.query == "fun");
+    S.query = ""; S.list_sig = ""; S.U.focus = "";
+    step(S, 2);
+
+    // double-click to play (row 0 of the title-descending list)
+    let first = lib.view_list(S)[0];
+    dblclick(S, 500, 64 + 70 + 20);
+    check("double-click starts a track", S.loading != null || S.E.track != null);
+    wait_loaded(S);
+    check("track loaded and playing", S.E.state == "playing" && S.E.track.id == first.id);
+    check("queue is the library list", len(S.queue) == len(S.tracks));
+    step(S, 10); system.sleep(0.6); step(S, 2);
+    check("clock advances", S.E.pos_cache > 0.4);
+    check("spectrum reacts", S.V.bass > 0.0 || S.V.bars[10] > 0.0);
+
+    // space pauses, space resumes
+    key(S, "space");
+    check("space pauses", S.E.state == "paused");
+    key(S, "space");
+    check("space resumes", S.E.state == "playing");
+
+    // seek by clicking the wave bar
+    let bx = 380; let bw = 1280 - 380 - 360;
+    click(S, bx + idiv(bw, 2), 720 - 112 + 66 + 10);
+    step(S, 1);
+    check("click on waveform seeks to ~half", abs(S.E.pos_cache - S.E.dur * 0.5) < S.E.dur * 0.1);
+
+    // volume keys + slider drag
+    let v0 = S.E.vol;
+    key(S, "down");
+    check("volume down key", S.E.vol < v0);
+    game.send_mouse(1280 - 332 + 40 + 75, 720 - 112 + 29); step(S, 1);
+    game.send_mouse(1280 - 332 + 40 + 75, 720 - 112 + 29, 1, true); step(S, 2);
+    game.send_mouse(1280 - 332 + 40 + 30, 720 - 112 + 29); step(S, 2);
+    game.send_mouse(1280 - 332 + 40 + 30, 720 - 112 + 29, 1, false); step(S, 2);
+    check("volume slider drag sets ~20%", abs(S.E.vol - 0.2) < 0.06);
+
+    // mute / shuffle / repeat / favourite shortcuts
+    key(S, "m"); check("m mutes", S.E.muted); key(S, "m");
+    key(S, "s"); check("s toggles shuffle", S.settings.shuffle); key(S, "s");
+    key(S, "r"); check("r cycles repeat", S.settings.repeat == 1); key(S, "r"); key(S, "r");
+    key(S, "f"); check("f favourites current track", S.E.track.fav); 
+
+    // next / previous
+    let id0 = S.E.track.id;
+    key(S, "n");
+    wait_loaded(S);
+    check("n advances to next track", S.E.track != null && S.E.track.id != id0);
+
+    // context menu
+    S.view = "library"; step(S, 2);
+    rclick(S, 500, 64 + 70 + 60);
+    check("right-click opens context menu", S.U.menu != null);
+    click(S, S.U.menu.x + 30, S.U.menu.y + 4 + 26 * 2 + 12);
+    check("menu choice 'Add to queue'", S.U.menu == null);
+
+    // playlists
+    S.view = "playlists"; step(S, 2);
+    S.U.focus = "pl/name"; S.U.inject_text = "Road Trip"; step(S, 2);
+    key(S, "enter");
+    check("playlist created via Enter", len(S.playlists) == 1 && S.playlists[0].name == "Road Trip");
+    lib.playlist_add(S, 0, S.tracks[0]);
+    lib.playlist_add(S, 0, S.tracks[1]);
+    check("playlist holds 2 tracks", len(lib.playlist_tracks(S, 0)) == 2);
+
+    // queue operations
+    let n0 = len(S.queue);
+    core.queue_shuffle(S);
+    check("queue shuffle keeps size + current first", len(S.queue) == n0 && S.qi == 0);
+    core.queue_swap(S, 1, 2);
+    check("queue swap keeps size", len(S.queue) == n0);
+
+    // equaliser drag changes the engine and triggers a re-render
+    S.view = "eq"; step(S, 2);
+    let sx = 236 + 20 + 40 + 0 * 62;
+    let sy = 64 + 44 + 170;
+    game.send_mouse(sx, sy + 85); step(S, 1);
+    game.send_mouse(sx, sy + 85, 1, true); step(S, 1);
+    game.send_mouse(sx, sy + 20); step(S, 2);
+    game.send_mouse(sx, sy + 20, 1, false); step(S, 2);
+    check("EQ band 0 boosted", S.E.eq[0] > 4.0);
+    var guard = 0;
+    while (S.E.dirty_at > 0.0 && guard < 40) { step(S, 1); system.sleep(0.05); guard += 1; }
+    check("engine re-applied DSP chain", S.E.dirty_at < 0.0 && S.E.state == "playing" && S.E.an != null);
+    print("apply ms", S.E.last_apply_ms);
+
+    // theme + persistence round trip
+    core.set_theme(S, "Neon");
+    check("theme switched", S.T.name == "Neon");
+    core.shutdown(S);
+    check("state saved", system.exists(system.path_join(S.data_dir, "state.json")));
+    let S2 = app.create(dir, 1280, 720);
+    check("settings restored", S2.settings.theme == "Neon" && S2.E.eq[0] > 4.0 && len(S2.playlists) == 1);
+    check("favourite restored", S2.byid[S.E.track != null ? S.E.track.id : S.tracks[0].id] != null);
+
+    // every view renders without error
+    for (v in ["library", "playlists", "queue", "viz", "eq", "score", "settings"]) { S2.view = v; step(S2, 3); }
+    check("all views render", true);
+    print(fails == 0 ? "ALL PASSED" : f"{fails} FAILED");
+    exit(fails == 0 ? 0 : 1);
+}

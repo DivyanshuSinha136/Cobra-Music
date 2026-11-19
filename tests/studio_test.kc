@@ -1,0 +1,78 @@
+// Studio (production engine) test: real clicks into the sequencer + piano roll, render, undo, save/load, export.
+import std.game;
+import std.system;
+import std.music_note;
+import "../src/app.kc" as app;
+import "../src/core.kc" as core;
+import "../src/studio.kc" as studio;
+
+var fails = 0;
+fn check(name, cond) { if (cond) { print("ok   - " + name); } else { print("FAIL - " + name); fails += 1; } }
+fn step(S, n) { for (i in 0..n) { game.poll(); app.frame(S, 0.033); game.present(); } }
+fn click(S, x, y) {
+    game.send_mouse(x, y); step(S, 1);
+    game.send_mouse(x, y, 1, true); step(S, 1);
+    game.send_mouse(x, y, 1, false); step(S, 1);
+}
+fn count_steps(tr) -> any {
+    var n = 0;
+    for (l in tr.lanes) { for (i in 0..64) { if (l.s[i] == 1) { n += 1; } } }
+    return n;
+}
+
+fn main() {
+    game.headless(true); game.window("t", 1280, 720); game.mode("2d");
+    let dir = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+    let S = app.create(dir, 1280, 720);
+    S.view = "studio"; step(S, 3);
+    let st = S.st;
+    check("blank project has drums+bass+lead", len(st.P.tracks) == 3);
+    let gx = 236 + 12 + 170 + 10 + 56;
+    let gy = 64 + 90;
+    // click kick lane step 0 and 4, snare step 4
+    click(S, gx + 5, gy + 10);
+    click(S, gx + 4 * 19 + 5, gy + 10);
+    click(S, gx + 4 * 19 + 5, gy + 40 + 10);
+    check("sequencer clicks toggle drum steps", count_steps(st.P.tracks[0]) == 3);
+    // undo removes the last edit
+    click(S, 236 + 346 + 30, 64 + 6 + 15);
+    check("undo reverts last edit", count_steps(st.P.tracks[0]) == 2);
+    // piano roll: select bass track, place a note
+    click(S, 236 + 12 + 80, 64 + 90 + 44 + 19);
+    check("selecting a track", st.sel == 1);
+    click(S, gx + 8 * 19 + 5, gy + 16 * 5 + 5);
+    check("piano roll click adds a note", len(st.P.tracks[1].notes) == 1);
+    click(S, gx + 8 * 19 + 5, gy + 16 * 5 + 5);
+    check("click on a note removes it", len(st.P.tracks[1].notes) == 0);
+    // templates, compile, render and play
+    studio.apply_template(S, "House");
+    let txt = studio.compile(st.P);
+    check("compiled notation has tracks", "track t1_kick drums" in txt && "track t2 " in txt);
+    check("notation parses", music_note.score_info(txt).notes > 50);
+    click(S, 236 + 12 + 75, 64 + 6 + 15);
+    check("Render & Play makes a track and plays", S.E.track != null && S.E.track.id == "studio:project" && S.E.state == "playing");
+    check("bpm-correct length (4 bars @124)", abs(S.E.dur - (4 * 4 * 60.0 / 124 + 1.2)) < 0.5);
+    check("score view gets notes for studio track", S.roll_id == "studio:project" && S.roll != null);
+    // mute / solo change the compile
+    st.P.tracks[0].mute = true;
+    check("muted track removed from notation", !("t1_kick" in studio.compile(st.P)));
+    st.P.tracks[0].mute = false;
+    // save / load
+    check("save project", studio.save_project(S) != null);
+    st.P.name = "Other";
+    check("open project", studio.open_project(S, "House_beat") && st.P.tracks[0].name == "Drums");
+    // exports
+    check("export wav", system.exists(studio.export_wav(S)));
+    check("export midi", system.exists(studio.export_midi(S)));
+    let before = len(S.tracks);
+    let kp = studio.export_kcm(S);
+    check("export .kcm adds it to the library", system.exists(kp) && len(S.tracks) == before + 1);
+    system.remove_file(kp);
+    // randomize + live preview toggle
+    studio.randomize(S);
+    check("randomize fills the selected track", len(st.P.tracks[st.sel].notes) > 0 || count_steps(st.P.tracks[st.sel]) > 0);
+    S.view = "studio"; step(S, 3);
+    game.screenshot("/tmp/shot_studio.png");
+    print(fails == 0 ? "ALL PASSED" : f"{fails} FAILED");
+    exit(fails == 0 ? 0 : 1);
+}

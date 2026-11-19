@@ -1,0 +1,27 @@
+// render_worker.kc — runs as a separate KingCobra process started by the engine so that rendering a track
+// (which can take seconds) never freezes the window.
+//   kingcobra run render_worker.kc gen  <style> <options> <out.wav>
+//   kingcobra run render_worker.kc kcm  <file.kcm> ""      <out.wav>
+import std.music_note;
+import std.system;
+
+fn main() -> any {
+    let a = system.args();
+    if (len(a) < 4) { eprintf("usage: render_worker mode spec options out.wav\n"); return 64; }
+    let mode = a[0];
+    let out = a[3];
+    var audio = null;
+    if (mode == "gen") {
+        audio = music_note.produce(a[1], a[2]);
+    } else if (mode == "kcm") {
+        audio = music_note.render(music_note.parse_file(a[1]), "normalize=true");
+    } else {
+        eprintf("unknown mode %s\n", mode);
+        return 64;
+    }
+    let tmp = out + ".part";
+    music_note.save_wav(audio, tmp, "bits=16");
+    music_note.free(audio);
+    system.rename(tmp, out);
+    return 0;
+}

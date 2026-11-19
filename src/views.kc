@@ -1,0 +1,540 @@
+// views.kc — window chrome (sidebar, top bar, player bar) and the list screens
+// (Library, Playlists, Queue). Everything is drawn with ui.kc widgets.
+import std.game;
+import "ui.kc" as ui;
+import "theme.kc" as theme;
+import "viz.kc" as viz;
+import "core.kc" as core;
+import "engine.kc" as engine;
+import "library.kc" as lib;
+
+const SIDE_W = 236;
+const TOP_H = 64;
+const PLAYER_H = 112;
+const ROW = 40;
+
+fn nav_items() -> any {
+    return [
+        { id: "library",   label: "Library",    icon: "disc" },
+        { id: "playlists", label: "Playlists",  icon: "list" },
+        { id: "queue",     label: "Queue",      icon: "queue" },
+        { id: "viz",       label: "Visualizer", icon: "wave" },
+        { id: "eq",        label: "Equalizer",  icon: "eq" },
+        { id: "score",     label: "Score",      icon: "score" },
+        { id: "studio",    label: "Studio",     icon: "note" },
+        { id: "settings",  label: "Settings",   icon: "gear" }
+    ];
+}
+
+fn view_title(id) -> any {
+    let items = nav_items();
+    for (it in items) { if (it.id == id) { return it.label; } }
+    return "";
+}
+
+// ---------------------------------------------------------------------------------------------
+// sidebar
+// ---------------------------------------------------------------------------------------------
+fn draw_sidebar(S) {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    let H = U.H;
+    game.rect(0, 0, SIDE_W, H - PLAYER_H, T.side);
+    game.rect(SIDE_W - 1, 0, 1, H - PLAYER_H, T.line);
+    // logo: the cobra-hood SVG (assets/icons/logo.svg) on a pulsing accent badge, wordmark in the display font
+    let lx = 38;
+    let ly = 34;
+    let pulse = int(S.V.kick * 3);
+    ui.disc(lx, ly, 22 + pulse, game.mix(T.side, T.accent, 0.22));
+    ui.disc(lx, ly, 19, T.accent);
+    ui.icon("logo", lx, ly - 1, 22, T.dark ? 0x0b0b12 : 0xffffff);
+    ui.text_display(70, 14, "COBRA", T.text, 22, 1.5);
+    ui.label(71, 40, "MUSIC STUDIO", T.dim);
+    // navigation
+    var y = 76;
+    let items = nav_items();
+    for (i in 0..len(items)) {
+        let it = items[i];
+        let id = "nav/" + it.id;
+        let active = S.view == it.id;
+        let clicked = ui.press(U, id, 10, y, SIDE_W - 20, 40);
+        let a = ui.anim(U, id, (U.hot == id || active) ? 1.0 : 0.0, 12.0);
+        if (a > 0.01) { ui.rrect(10, y, SIDE_W - 20, 40, 8, game.mix(T.side, active ? T.panel2 : T.panel, a)); }
+        if (active) { ui.rrect(10, y + 8, 4, 24, 2, T.accent); }
+        ui.icon(it.icon, 36, y + 20, 18, active ? T.accent : game.mix(T.dim, T.text, a));
+        if (active) { ui.text_b(58, y + 14, it.label, T.text, 2); } else { ui.text(58, y + 14, it.label, game.mix(T.dim, T.text, a), 2); }
+        if (it.id == "queue" && len(S.queue) > 0) {
+            ui.text_r(SIDE_W - 22, y + 16, "" + len(S.queue), T.dim, 1);
+        }
+        if (clicked) { S.view = it.id; }
+        y += 44;
+    }
+    // footer status
+    let fy = H - PLAYER_H - 96;
+    ui.hline(18, fy - 8, SIDE_W - 36, T.line);
+    ui.text(18, fy, f"{len(S.tracks)} tracks", T.dim, 1);
+    ui.text(18, fy + 14, f"{len(S.playlists)} playlists", T.dim, 1);
+    var led = E.silent ? T.warn : T.good;
+    game.circle(24, fy + 40, 4, led);
+    ui.text_fit(36, fy + 36, SIDE_W - 50, E.silent ? "silent mode" : E.player, T.dim, 1);
+    if (S.sleep_at > 0.0) {
+        let left = S.sleep_at - system_now();
+        ui.icon("clock", 24, fy + 62, 12, T.accent2);
+        ui.text(36, fy + 58, "sleep " + ui.fmt_time(left), T.accent2, 1);
+    }
+}
+
+fn system_now() -> any { return clock(); }
+
+// ---------------------------------------------------------------------------------------------
+// top bar
+// ---------------------------------------------------------------------------------------------
+fn draw_topbar(S) {
+    let U = S.U;
+    let T = S.T;
+    let x = SIDE_W;
+    let w = U.W - SIDE_W;
+    game.rect(x, 0, w, TOP_H, T.bg);
+    ui.text(x + 24, 20, view_title(S.view), T.text, 3);
+    if (S.view == "library" || S.view == "playlists") {
+        let sx = U.W - 340;
+        ui.icon("search", sx + 18, 32, 16, T.dim);
+        let q = ui.text_input(U, "search", sx + 34, 16, 290, 32, S.query, "Search title, artist, genre...");
+        if (q != S.query) { S.query = q; S.list_sig = ""; }
+        if (len(S.query) > 0) {
+            if (ui.icon_button(U, "search/x", sx + 300, 20, 24, "close", false, "Clear search")) { S.query = ""; S.list_sig = ""; U.focus = ""; }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// player bar
+// ---------------------------------------------------------------------------------------------
+fn draw_player(S) {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    let y = U.H - PLAYER_H;
+    let W = U.W;
+    game.rect_grad(0, y, W, PLAYER_H, T.panel, T.side);
+    game.rect(0, y, W, 1, T.line);
+    let t = E.track;
+    let pos = E.pos_cache;
+    // ---- left: cover + info
+    if (t != null) {
+        ui.shadow(18, y + 16, 80, 80, 6);
+        ui.cover(18, y + 16, 80, t.seed, S.V.kick, T);
+        ui.text_fit_b(112, y + 24, 230, t.title, T.text, 2);
+        ui.text_fit(112, y + 48, 200, t.artist, T.dim, 1);
+        ui.text_fit(112, y + 62, 200, t.album, T.dim, 1);
+        let hid = "player/fav";
+        if (ui.icon_button(U, hid, 112, y + 74, 26, t.fav ? "heart_on" : "heart", t.fav, t.fav ? "Remove from favorites" : "Add to favorites")) { core.toggle_fav(S, t); }
+        if (ui.icon_button(U, "player/q", 142, y + 74, 26, "queue", S.view == "queue", "Show queue")) { S.view = "queue"; }
+    } else {
+        ui.rrect(18, y + 16, 80, 80, 6, T.panel2);
+        ui.icon("note", 58, y + 56, 32, T.dim);
+        ui.text(112, y + 36, "Nothing playing", T.dim, 2);
+        ui.text(112, y + 60, "Pick a track from the library", T.dim, 1);
+    }
+    // ---- centre: transport + seek bar
+    let cx = idiv(W, 2) + 40;
+    let ty = y + 30;
+    if (ui.icon_button(U, "t/shuffle", cx - 150, ty - 16, 32, "shuffle", S.settings.shuffle, S.settings.shuffle ? "Shuffle: on" : "Shuffle: off")) { core.set_shuffle(S, !S.settings.shuffle); }
+    if (ui.icon_button(U, "t/prev", cx - 100, ty - 16, 32, "prev", false, "Previous (P)")) { core.advance(S, -1, false); }
+    let playing = E.state == "playing";
+    if (S.loading != null) {
+        // spinner while a background render runs
+        game.circle(cx, ty, 24, T.panel2);
+        for (i in 0..8) {
+            let a = U.t * 6.0 + i * 0.785;
+            let f = 1.0 - i / 8.0;
+            game.circle(cx + int(cos(a) * 14), ty + int(sin(a) * 14), 3, game.mix(T.panel2, T.accent, f));
+        }
+    } else if (ui.round_button(U, "t/play", cx, ty, 22, playing ? "pause" : "play", playing ? "Pause (Space)" : "Play (Space)")) { core.toggle_play(S); }
+    if (ui.icon_button(U, "t/next", cx + 68, ty - 16, 32, "next", false, "Next (N)")) { core.advance(S, 1, false); }
+    let rep = S.settings.repeat;
+    if (ui.icon_button(U, "t/repeat", cx + 118, ty - 16, 32, rep == 2 ? "repeat1" : "repeat", rep > 0, rep == 0 ? "Repeat: off" : (rep == 1 ? "Repeat: all" : "Repeat: one"))) { core.cycle_repeat(S); }
+    // seek bar
+    let bx = 380;
+    let bw = W - 380 - 360;
+    let by = y + 66;
+    let dur = E.dur;
+    var frac = dur > 0.0 ? clamp(pos / dur, 0.0, 1.0) : 0.0;
+    let f = ui.drag_x(U, "seek", bx, by - 4, bw, 40);
+    var hover = -1.0;
+    if (f >= 0.0) { frac = f; hover = f; }
+    else if (U.hot == "seek") { hover = clamp((U.mx - bx) / (bw * 1.0), 0.0, 1.0); }
+    viz.draw_wavebar(U, E, bx, by, bw, 32, frac, hover);
+    ui.text_r(bx - 10, by + 12, ui.fmt_time(f >= 0.0 ? f * dur : pos), T.text, 1);
+    ui.text(bx + bw + 10, by + 12, ui.fmt_time(dur), T.dim, 1);
+    if (U.drag_end == "seek" && E.raw != null) { engine.seek(E, U.drag_f * dur); }
+    if (hover >= 0.0 && dur > 0.0) {
+        let tip = ui.fmt_time(hover * dur);
+        let tx = clamp(bx + int(bw * hover) - 20, bx, bx + bw - 44);
+        ui.rrect(tx, by - 24, ui.tw(tip, 1) + 14, 18, 5, T.panel2);
+        ui.text(tx + 7, by - 20, tip, T.text, 1);
+    }
+    // ---- right: volume, speed, mini visualiser
+    let rx = W - 332;
+    if (ui.icon_button(U, "vol/mute", rx, y + 14, 30, (E.muted || E.vol < 0.01) ? "mute" : "vol", E.muted, E.muted ? "Unmute (M)" : "Mute (M)")) { core.toggle_mute(S); }
+    let nv = ui.slider(U, "vol", rx + 40, y + 29, 150, E.muted ? 0.0 : E.vol, 0.0, 1.0);
+    if (U.changed && U.active == "vol" || U.changed && U.hot == "vol") { core.set_volume(S, nv); }
+    ui.text(rx + 204, y + 25, sprintf("%3d%%", int((E.muted ? 0.0 : E.vol) * 100.0 + 0.5)), T.dim, 1);
+    // speed chip
+    let sp = sprintf("%.2fx", E.speed);
+    if (ui.chip(U, "speed", rx, y + 56, "Speed " + sp, abs(E.speed - 1.0) > 0.01)) {
+        var ns = E.speed + 0.25;
+        if (ns > 1.51) { ns = 0.75; }
+        E.speed = ns;
+        engine.changed(E);
+    }
+    ui.tooltip(U, rx, y + 56, ui.chip_w("Speed " + sp), 24, "Click to cycle playback speed (pitch preserved)");
+    if (ui.chip(U, "fx", rx + ui.chip_w("Speed 1.00x") + 8, y + 56, "EQ", engine.fx_active(E))) { S.view = "eq"; }
+    // mini spectrum
+    if (S.settings.show_mini_viz) {
+        let mx = rx + 214;
+        for (i in 0..16) {
+            let v = S.V.bars[i * 4];
+            let bh = max(2, int(v * 40));
+            game.rect(mx + i * 7 - 70, y + 100 - bh - 0, 5, bh, game.mix(T.accent2, T.accent, i / 15.0));
+        }
+    }
+    if (E.dirty_at > 0.0 && E.state == "playing") { ui.text(rx, y + 90, "applying changes...", T.dim, 1); }
+}
+
+// ---------------------------------------------------------------------------------------------
+// shared: a track row used in library / playlist / queue lists
+// ---------------------------------------------------------------------------------------------
+fn open_track_menu(S, t, mx, my) {
+    S.ctx_track = t;
+    let items = ["Play", "Play next", "Add to queue", "Add to playlist...", t.fav ? "Remove favorite" : "Add to favorites", "-", "Track info"];
+    ui.menu_open(S.U, mx, my, items, "ctx");
+}
+
+fn handle_menus(S) {
+    let U = S.U;
+    let c = ui.take_choice(U, "ctx");
+    if (c != null && S.ctx_track != null) {
+        let t = S.ctx_track;
+        if (c.label == "Play") { core.play_ctx(S, t, [t]); }
+        else if (c.label == "Play next") { core.enqueue(S, t, true); }
+        else if (c.label == "Add to queue") { core.enqueue(S, t, false); }
+        else if (c.label == "Add to playlist...") {
+            var names = [];
+            for (p in S.playlists) { push(names, p.name); }
+            push(names, "-");
+            push(names, "+ New playlist");
+            ui.menu_open(U, U.mx, U.my, names, "pl_add");
+        }
+        else if (c.label == "Track info") { S.modal = t; }
+        else { core.toggle_fav(S, t); }
+    }
+    let c2 = ui.take_choice(U, "pl_add");
+    if (c2 != null && S.ctx_track != null) {
+        let t = S.ctx_track;
+        if (c2.index < len(S.playlists)) {
+            if (lib.playlist_add(S, c2.index, t)) { ui.toast(U, "Added to " + S.playlists[c2.index].name); }
+            else { ui.toast(U, "Already in " + S.playlists[c2.index].name); }
+        } else {
+            let idx = lib.playlist_new(S, "");
+            lib.playlist_add(S, idx, t);
+            ui.toast(U, "Created " + S.playlists[idx].name);
+        }
+    }
+}
+
+// draws the columns of a track row; returns nothing. cols = layout from col_layout()
+fn col_layout(w) -> any {
+    let avail = w - 20 - 44 - 40 - 40 - 70 - 56 - 90 - 30;
+    let tw = idiv(avail * 40, 100);
+    let aw = idiv(avail * 30, 100);
+    let bw = avail - tw - aw;
+    let x0 = 20;
+    let xt = x0 + 44;
+    let xa = xt + tw + 8;
+    let xb = xa + aw + 8;
+    let xg = xb + bw + 8;
+    let xm = xg + 90;
+    let xp = xm + 70;
+    let xh = xp + 56;
+    return { idx: x0, title: xt, title_w: tw, artist: xa, artist_w: aw, album: xb, album_w: bw, genre: xg, time: xm, plays: xp, heart: xh, more: xh + 40 };
+}
+
+fn draw_header(S, x, y, w, c, sortable) {
+    let U = S.U;
+    let T = S.T;
+    ui.hline(x + 12, y + 28, w - 24, T.line);
+    let defs = [["#", c.idx, "added"], ["TITLE", c.title, "title"], ["ARTIST", c.artist, "artist"], ["ALBUM", c.album, "album"], ["GENRE", c.genre, "genre"], ["TIME", c.time, "time"], ["PLAYS", c.plays, "plays"]];
+    for (d in defs) {
+        let label = d[0];
+        var shown = label;
+        if (sortable && S.sort_col == d[2]) { shown = label + (S.sort_asc ? " ^" : " v"); }
+        let id = "hdr/" + d[2];
+        let hw = ui.label_w(shown) + 8;
+        if (sortable && ui.press(U, id, x + d[1] - 4, y + 4, hw, 22)) {
+            if (S.sort_col == d[2]) { S.sort_asc = !S.sort_asc; } else { S.sort_col = d[2]; S.sort_asc = true; }
+            S.list_sig = "";
+        }
+        let a = ui.anim(U, id, U.hot == id ? 1.0 : 0.0, 12.0);
+        ui.label(x + d[1], y + 10, shown, (sortable && S.sort_col == d[2]) ? T.accent : game.mix(T.dim, T.text, a));
+    }
+}
+
+// one row. i = row index, list = the array it belongs to (for play context). returns true when row was acted on
+fn draw_row(S, t, i, x, ry, w, c, list, idp, show_idx, extra) -> any {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    let playing_now = E.track != null && E.track.id == t.id;
+    let hover = ui.hit(U, x + 8, ry, w - 16, ROW);
+    let a = ui.anim(U, idp + i, (hover || S.sel == t.id) ? 1.0 : 0.0, 14.0);
+    if (playing_now) { ui.rrect(x + 8, ry + 2, w - 16, ROW - 4, 8, game.mix(T.panel, T.accent, 0.22)); }
+    else if (a > 0.01) { ui.rrect(x + 8, ry + 2, w - 16, ROW - 4, 8, game.mix(T.bg, T.panel2, a * (S.sel == t.id ? 1.0 : 0.7))); }
+    // index / equaliser glyph
+    if (playing_now) { ui.playing_bars(x + c.idx + 2, ry + 10, U.t, T.accent, E.state == "playing"); }
+    else if (hover) { ui.icon("play", x + c.idx + 8, ry + 20, 12, T.text); }
+    else if (show_idx) { ui.text(x + c.idx, ry + 16, "" + (i + 1), T.dim, 1); }
+    let tc = playing_now ? T.accent : T.text;
+    ui.text_fit(x + c.title, ry + 8, c.title_w, t.title, tc, 2);
+    ui.text_fit(x + c.artist, ry + 16, c.artist_w, t.artist, T.dim, 1);
+    ui.text_fit(x + c.album, ry + 16, c.album_w, t.album, T.dim, 1);
+    ui.text(x + c.genre, ry + 16, ui.fit(t.genre, 80, 1), T.dim, 1);
+    ui.text(x + c.time, ry + 16, t.dur > 0.0 ? ui.fmt_time(t.dur) : "--:--", T.dim, 1);
+    ui.text(x + c.plays, ry + 16, "" + t.plays, T.dim, 1);
+    // heart
+    let hx = x + c.heart;
+    var acted = false;
+    let hid = idp + "h" + i;
+    let hh = ui.press(U, hid, hx, ry + 8, 24, 24);
+    ui.icon(t.fav ? "heart_on" : "heart", hx + 12, ry + 20, 14, t.fav ? T.accent : (U.hot == hid ? T.text : game.mix(T.dim, T.bg, 0.3)));
+    if (hh) { core.toggle_fav(S, t); acted = true; }
+    // more
+    let mx = x + c.more;
+    let mid = idp + "m" + i;
+    let mm = ui.press(U, mid, mx, ry + 8, 24, 24);
+    ui.icon("list", mx + 12, ry + 20, 14, U.hot == mid ? T.text : game.mix(T.dim, T.bg, 0.3));
+    if (mm) { open_track_menu(S, t, mx - 100, ry + 30); acted = true; }
+    if (!acted && hover && !ui.hit(U, hx, ry + 8, 64, 24)) {
+        if (U.pressed) { S.sel = t.id; if (U.dbl) { core.play_ctx(S, t, list); } }
+        if (U.rpressed) { S.sel = t.id; open_track_menu(S, t, U.mx, U.my); }
+    }
+    return acted;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Library
+// ---------------------------------------------------------------------------------------------
+fn view_library(S, x, y, w, h) -> any {
+    let U = S.U;
+    let T = S.T;
+    var cx = x + 20;
+    let gs = lib.genres(S);
+    for (i in 0..len(gs)) {
+        if (ui.chip(U, "g/" + gs[i], cx, y + 8, gs[i], S.genre == gs[i])) { S.genre = gs[i]; S.list_sig = ""; }
+        cx += ui.chip_w(gs[i]) + 8;
+    }
+    let list = lib.view_list(S);
+    ui.text_r(x + w - 24, y + 16, f"{len(list)} of {len(S.tracks)} tracks", T.dim, 1);
+    let c = col_layout(w);
+    draw_header(S, x, y + 36, w, c, true);
+    let ly = y + 70;
+    let lh = h - 70;
+    if (len(list) == 0) {
+        ui.text_c(x + idiv(w, 2), ly + 60, "No tracks match", T.dim, 2);
+        ui.text_c(x + idiv(w, 2), ly + 92, "Try another search or genre filter", T.dim, 1);
+        return 0;
+    }
+    let off = ui.scroll(U, "lib/scroll", x, ly, w, lh, len(list) * ROW + 12);
+    ui.clip_set(U, x, ly, w, lh);
+    let first = max(0, idiv(off, ROW));
+    let last = min(len(list) - 1, idiv(off + lh, ROW));
+    for (i in first..last + 1) {
+        draw_row(S, list[i], i, x, ly + i * ROW - off, w - 14, c, list, "lr/", true, null);
+    }
+    ui.clip_reset(U);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Queue
+// ---------------------------------------------------------------------------------------------
+fn view_queue(S, x, y, w, h) -> any {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    let n = len(S.queue);
+    if (ui.button(U, "q/shuffle", x + w - 330, y + 10, 100, 32, "Shuffle", "ghost")) { core.queue_shuffle(S); }
+    if (ui.button(U, "q/clear", x + w - 220, y + 10, 100, 32, "Clear", "ghost")) {
+        S.queue = [];
+        S.qi = -1;
+        engine.stop(E);
+    }
+    if (ui.button(U, "q/save", x + w - 110, y + 10, 90, 32, "Save", "primary")) {
+        if (n > 0) {
+            let idx = lib.playlist_new(S, "Queue " + (len(S.playlists) + 1));
+            for (id in S.queue) { let t = lib.find(S, id); if (t != null) { lib.playlist_add(S, idx, t); } }
+            ui.toast(U, "Saved queue as " + S.playlists[idx].name);
+        }
+    }
+    ui.text(x + 24, y + 20, n == 0 ? "Queue is empty" : f"{n} tracks in queue", T.dim, 1);
+    if (n == 0) {
+        ui.text_c(x + idiv(w, 2), y + 140, "Nothing queued", T.dim, 3);
+        ui.text_c(x + idiv(w, 2), y + 180, "Right-click any track and choose Play next / Add to queue", T.dim, 1);
+        return 0;
+    }
+    let ly = y + 56;
+    let lh = h - 56;
+    let off = ui.scroll(U, "q/scroll", x, ly, w, lh, n * ROW + 12);
+    ui.clip_set(U, x, ly, w, lh);
+    let first = max(0, idiv(off, ROW));
+    let last = min(n - 1, idiv(off + lh, ROW));
+    for (i in first..last + 1) {
+        let t = lib.find(S, S.queue[i]);
+        if (t == null) { continue; }
+        let ry = ly + i * ROW - off;
+        let cur = i == S.qi;
+        let hover = ui.hit(U, x + 8, ry, w - 160, ROW);
+        let a = ui.anim(U, "qr/" + i, hover ? 1.0 : 0.0, 14.0);
+        if (cur) { ui.rrect(x + 8, ry + 2, w - 30, ROW - 4, 8, game.mix(T.panel, T.accent, 0.22)); }
+        else if (a > 0.01) { ui.rrect(x + 8, ry + 2, w - 30, ROW - 4, 8, game.mix(T.bg, T.panel2, a)); }
+        if (cur) { ui.playing_bars(x + 22, ry + 10, U.t, T.accent, E.state == "playing"); }
+        else { ui.text(x + 22, ry + 16, "" + (i + 1), T.dim, 1); }
+        ui.text_fit(x + 64, ry + 8, w - 400, t.title, cur ? T.accent : T.text, 2);
+        ui.text_fit(x + w - 330, ry + 16, 140, t.artist, T.dim, 1);
+        ui.text(x + w - 180, ry + 16, t.dur > 0.0 ? ui.fmt_time(t.dur) : "--:--", T.dim, 1);
+        if (hover && U.pressed && U.dbl) { S.qi = i; core.start_track(S, t, true); }
+        if (ui.icon_button(U, "qu/" + i, x + w - 140, ry + 6, 28, "up", false, "Move up")) { core.queue_swap(S, i, i - 1); }
+        if (ui.icon_button(U, "qd/" + i, x + w - 108, ry + 6, 28, "down", false, "Move down")) { core.queue_swap(S, i, i + 1); }
+        if (!cur) {
+            if (ui.icon_button(U, "qx/" + i, x + w - 76, ry + 6, 28, "close", false, "Remove")) { core.queue_remove(S, i); }
+        }
+    }
+    ui.clip_reset(U);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Playlists
+// ---------------------------------------------------------------------------------------------
+fn pl_tracks(S) -> any {
+    if (S.pl_sel == -1) {
+        var out = [];
+        for (t in S.tracks) { if (t.fav) { push(out, t); } }
+        return out;
+    }
+    if (S.pl_sel == -3) {
+        var played = [];
+        for (t in S.tracks) { if (t.plays > 0) { push(played, t); } }
+        return lib.sort_tracks(played, "plays", false);
+    }
+    if (S.pl_sel == -2) {
+        var out = [];
+        for (id in S.recent) { let t = lib.find(S, id); if (t != null) { push(out, t); } }
+        return out;
+    }
+    return lib.playlist_tracks(S, S.pl_sel);
+}
+
+fn view_playlists(S, x, y, w, h) -> any {
+    let U = S.U;
+    let T = S.T;
+    let lw = 250;
+    // left column: playlists
+    ui.panel(U, x + 16, y + 8, lw, h - 16, 10);
+    var yy = y + 20;
+    let fixed = [["Favorites", -1], ["Recently played", -2], ["Most played", -3]];
+    for (f in fixed) {
+        let sel = S.pl_sel == f[1];
+        let id = "pl/f" + f[1];
+        let clk = ui.press(U, id, x + 24, yy, lw - 16, 34);
+        if (sel) { ui.rrect(x + 24, yy, lw - 16, 34, 7, T.accent); }
+        else if (U.hot == id) { ui.rrect(x + 24, yy, lw - 16, 34, 7, T.panel2); }
+        ui.icon(f[1] == -1 ? "heart_on" : (f[1] == -3 ? "up" : "clock"), x + 42, yy + 17, 14, sel ? (T.dark ? 0x0b0b12 : 0xffffff) : T.accent);
+        ui.text(x + 60, yy + 13, f[0], sel ? (T.dark ? 0x0b0b12 : 0xffffff) : T.text, 1);
+        if (clk) { S.pl_sel = f[1]; }
+        yy += 38;
+    }
+    ui.hline(x + 28, yy, lw - 24, T.line);
+    yy += 10;
+    for (i in 0..len(S.playlists)) {
+        let sel = S.pl_sel == i;
+        let id = "pl/" + i;
+        let clk = ui.press(U, id, x + 24, yy, lw - 16, 34);
+        if (sel) { ui.rrect(x + 24, yy, lw - 16, 34, 7, T.accent); }
+        else if (U.hot == id) { ui.rrect(x + 24, yy, lw - 16, 34, 7, T.panel2); }
+        ui.icon("list", x + 42, yy + 17, 14, sel ? (T.dark ? 0x0b0b12 : 0xffffff) : T.dim);
+        ui.text_fit(x + 60, yy + 13, lw - 90, S.playlists[i].name, sel ? (T.dark ? 0x0b0b12 : 0xffffff) : T.text, 1);
+        ui.text_r(x + lw - 6, yy + 13, "" + len(S.playlists[i].ids), sel ? (T.dark ? 0x0b0b12 : 0xffffff) : T.dim, 1);
+        if (clk) { S.pl_sel = i; }
+        yy += 38;
+        if (yy > y + h - 90) { break; }
+    }
+    // new playlist input
+    let iy = y + h - 64;
+    let nm = ui.text_input(U, "pl/name", x + 24, iy, lw - 62, 32, S.pl_name, "New playlist name");
+    S.pl_name = nm;
+    let create = ui.icon_button(U, "pl/create", x + lw - 30, iy + 2, 28, "plus", true, "Create playlist");
+    if (create || U.submit == "pl/name") {
+        let idx = lib.playlist_new(S, S.pl_name);
+        S.pl_name = "";
+        S.pl_sel = idx;
+        ui.toast(U, "Created " + S.playlists[idx].name);
+    }
+    // right: tracks
+    let rx = x + lw + 30;
+    let rw = w - lw - 40;
+    var title = "Favorites";
+    if (S.pl_sel == -2) { title = "Recently played"; }
+    if (S.pl_sel == -3) { title = "Most played"; }
+    if (S.pl_sel >= 0 && S.pl_sel < len(S.playlists)) { title = S.playlists[S.pl_sel].name; }
+    ui.text(rx + 8, y + 16, ui.fit(title, rw - 360, 2), T.text, 2);
+    let list = pl_tracks(S);
+    ui.text(rx + 8, y + 40, f"{len(list)} tracks", T.dim, 1);
+    if (ui.button(U, "pl/play", x + w - 270, y + 12, 90, 32, "Play", "primary")) {
+        if (len(list) > 0) { core.play_ctx(S, list[0], list); }
+    }
+    if (ui.button(U, "pl/shuf", x + w - 170, y + 12, 90, 32, "Shuffle", "ghost")) {
+        if (len(list) > 0) {
+            core.set_shuffle(S, true);
+            core.play_ctx(S, list[rand() % len(list)], list);
+        }
+    }
+    if (S.pl_sel >= 0) {
+        if (ui.icon_button(U, "pl/del", x + w - 70, y + 14, 30, "trash", false, "Delete playlist")) {
+            S.playlists = lib.array_remove_at(S.playlists, S.pl_sel);
+            S.pl_sel = -1;
+        }
+    }
+    if (len(list) == 0) {
+        ui.text_c(rx + idiv(rw, 2), y + 160, "This list is empty", T.dim, 2);
+        ui.text_c(rx + idiv(rw, 2), y + 192, "Right-click a track in the library -> Add to playlist", T.dim, 1);
+        return 0;
+    }
+    let ly = y + 64;
+    let lh = h - 64;
+    let off = ui.scroll(U, "pl/scroll", rx, ly, rw, lh, len(list) * ROW + 12);
+    ui.clip_set(U, rx, ly, rw, lh);
+    let first = max(0, idiv(off, ROW));
+    let last = min(len(list) - 1, idiv(off + lh, ROW));
+    for (i in first..last + 1) {
+        let t = list[i];
+        let ry = ly + i * ROW - off;
+        let playing_now = S.E.track != null && S.E.track.id == t.id;
+        let hover = ui.hit(U, rx + 4, ry, rw - 150, ROW);
+        let a = ui.anim(U, "plr/" + i, hover ? 1.0 : 0.0, 14.0);
+        if (playing_now) { ui.rrect(rx + 4, ry + 2, rw - 24, ROW - 4, 8, game.mix(T.panel, T.accent, 0.22)); }
+        else if (a > 0.01) { ui.rrect(rx + 4, ry + 2, rw - 24, ROW - 4, 8, game.mix(T.bg, T.panel2, a)); }
+        if (playing_now) { ui.playing_bars(rx + 14, ry + 10, U.t, T.accent, S.E.state == "playing"); }
+        else { ui.text(rx + 14, ry + 16, "" + (i + 1), T.dim, 1); }
+        ui.text_fit(rx + 50, ry + 8, rw - 330, t.title, playing_now ? T.accent : T.text, 2);
+        ui.text_fit(rx + rw - 270, ry + 16, 120, t.artist, T.dim, 1);
+        ui.text(rx + rw - 140, ry + 16, t.dur > 0.0 ? ui.fmt_time(t.dur) : "--:--", T.dim, 1);
+        if (hover && U.pressed && U.dbl) { core.play_ctx(S, t, list); }
+        if (S.pl_sel >= 0) {
+            let p = S.playlists[S.pl_sel];
+            if (ui.icon_button(U, "plu/" + i, rx + rw - 110, ry + 6, 28, "up", false, "Move up")) { p.ids = lib.array_move(p.ids, i, i - 1); }
+            if (ui.icon_button(U, "pld/" + i, rx + rw - 80, ry + 6, 28, "down", false, "Move down")) { p.ids = lib.array_move(p.ids, i, i + 1); }
+            if (ui.icon_button(U, "plx/" + i, rx + rw - 50, ry + 6, 28, "close", false, "Remove from playlist")) { p.ids = lib.array_remove_at(p.ids, i); }
+        }
+    }
+    ui.clip_reset(U);
+}

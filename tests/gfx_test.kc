@@ -1,0 +1,97 @@
+// Tests for the vector engine (SVG + rasteriser), the TrueType parser and the graphics layer.
+//   KC_MUSIC_SILENT=1 kingcobra run tests/gfx_test.kc
+import std.game;
+import std.system;
+import std.io;
+import "../src/vec.kc" as vec;
+import "../src/ttf.kc" as ttf;
+import "../src/gfx.kc" as gfx;
+
+var fails = 0;
+fn check(name, cond) { if (cond) { print("ok   - " + name); } else { print("FAIL - " + name); fails += 1; } }
+fn near(a, b, tol) -> any { return abs(a - b) <= tol; }
+fn area(cov) -> any { var s = 0.0; for (c in cov) { s += c; } return s; }
+
+fn main() {
+    game.headless(true); game.window("t", 200, 100); game.mode("2d");
+    let dir = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+
+    // ---------- rasteriser ----------
+    let sq = vec.render(vec.parse("<svg viewBox=\"0 0 10 10\"><rect x=\"2\" y=\"2\" width=\"6\" height=\"6\"/></svg>"), 40, 40, 0.0);
+    check("rect area is exact (24x24 px)", near(area(sq), 576.0, 0.5));
+    let pix = vec.render(vec.parse("<svg viewBox=\"0 0 4 4\"><rect x=\"1.5\" y=\"0\" width=\"1\" height=\"4\"/></svg>"), 4, 4, 0.0);
+    check("half-covered pixels get fractional coverage", near(pix[1], 0.5, 0.02) && near(pix[2], 0.5, 0.02) && pix[0] == 0.0);
+    let cir = vec.render(vec.parse("<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"10\"/></svg>"), 96, 96, 0.0);
+    check("circle area ~ pi r^2", near(area(cir), 3.14159 * 40.0 * 40.0, 40.0));
+    let ring = vec.render(vec.parse("<svg viewBox=\"0 0 24 24\"><path fill-rule=\"evenodd\" d=\"M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20zM12 7a5 5 0 1 0 0 10a5 5 0 1 0 0-10z\"/></svg>"), 96, 96, 0.0);
+    check("even-odd leaves the hole empty", near(area(ring), 3.14159 * (40.0 * 40.0 - 20.0 * 20.0), 40.0) && ring[48 * 96 + 48] == 0.0);
+    let stroke = vec.render(vec.parse("<svg viewBox=\"0 0 10 10\"><path d=\"M1 5H9\" stroke=\"#000\" stroke-width=\"2\" fill=\"none\"/></svg>"), 100, 100, 0.0);
+    check("butt-capped stroke covers length x width", near(area(stroke), 80.0 * 20.0, 30.0));
+    let rcap = vec.render(vec.parse("<svg viewBox=\"0 0 10 10\"><path d=\"M2 5H8\" stroke=\"#000\" stroke-width=\"2\" stroke-linecap=\"round\" fill=\"none\"/></svg>"), 100, 100, 0.0);
+    check("round caps add a disc of area", near(area(rcap), 60.0 * 20.0 + 3.14159 * 100.0, 40.0));
+    let tri = vec.parse("<svg viewBox=\"0 0 24 24\"><path d=\"M8 5v14l11-7z\"/></svg>");
+    check("path with v/l/z parses to one closed triangle", len(tri.shapes) == 1 && len(tri.shapes[0].contours[0]) == 6);
+    let rel = vec.parse_path("m10 10 l5 0 5 5 h-3 v-2 z");
+    check("relative + implicit commands", rel.contours[0][len(rel.contours[0]) - 2] == 17.0 || len(rel.contours[0]) >= 10);
+    let arc = vec.parse_path("M0 0 A5 5 0 0 1 10 0");
+    var maxy = 0.0; var i = 1;
+    while (i < len(arc.contours[0])) { maxy = max(maxy, abs(arc.contours[0][i])); i += 2; }
+    check("arc bulges to its radius", near(maxy, 5.0, 0.2));
+    let tr = vec.render(vec.parse("<svg viewBox=\"0 0 10 10\"><g transform=\"translate(5 0) scale(0.5)\"><rect width=\"10\" height=\"10\"/></g></svg>"), 40, 40, 0.0);
+    check("group transforms apply", near(area(tr), 20.0 * 20.0, 2.0) && tr[5 * 40 + 25] > 0.99 && tr[5 * 40 + 5] == 0.0);
+    let op = vec.render(vec.parse("<svg viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" opacity=\"0.5\"/></svg>"), 10, 10, 0.0);
+    check("opacity scales coverage", near(op[55], 0.5, 0.01));
+    let st = vec.parse("<svg viewBox=\"0 0 10 10\"><rect width=\"4\" height=\"4\" style=\"fill:none;stroke:#fff;stroke-width:1\"/></svg>");
+    check("style attribute parsed", !st.shapes[0].fill && st.shapes[0].stroke);
+
+    // ---------- every shipped icon ----------
+    let idir = system.path_join(dir, "assets", "icons");
+    var n = 0; var empty = 0;
+    for (f in system.list_dir(idir)) {
+        if (system.extension(f) == ".svg") {
+            n += 1;
+            let d = vec.parse(io_read(system.path_join(idir, f)));
+            if (area(vec.render(d, 24, 24, 0.0)) < 6.0) { empty += 1; print("empty icon", f); }
+        }
+    }
+    check("all shipped SVG icons render (>= 30)", n >= 30 && empty == 0);
+
+    // ---------- TrueType ----------
+    let F = ttf.load(system.path_join(dir, "assets", "fonts", "InstrumentSans-Regular.ttf"));
+    check("font header parsed", F != null && F.upm == 1000 && F.nglyphs > 400 && F.cmap_fmt != 0);
+    let ga = ttf.glyph_index(F, 65);
+    check("cmap maps A to a real glyph", ga > 0 && ttf.advance(F, ga) > 400);
+    check("unknown code point maps to .notdef", ttf.glyph_index(F, 0x1F600) == 0);
+    check("glyph outline has contours", len(ttf.outline(F, ga, 0).contours) >= 2);
+    let gO = ttf.outline(F, ttf.glyph_index(F, 79), 0);
+    check("O has an outer and an inner contour", len(gO.contours) == 2);
+
+    // ---------- graphics layer ----------
+    let G = gfx.new(dir);
+    check("fonts loaded (regular, bold, display)", gfx.has_fonts(G) && G.fonts[1] != null && G.fonts[2] != null);
+    check("UTF-8 decoding", gfx.cps(G, "aé€") == [97, 233, 8364]);
+    check("code point offsets", gfx.cp_offsets(G, "aé€") == [0, 1, 3]);
+    let w1 = gfx.measure(G, "Hello", 17, 0, 0.0);
+    let w2 = gfx.measure(G, "Hello World", 17, 0, 0.0);
+    check("measurement grows with text and size", w2 > w1 && gfx.measure(G, "Hello", 34, 0, 0.0) > w1 * 1.9);
+    check("proportional: i is narrower than m", gfx.measure(G, "i", 17, 0, 0.0) < gfx.measure(G, "m", 17, 0, 0.0) * 0.6);
+    check("bold is wider than regular", gfx.measure(G, "Cobra Music", 17, 1, 0.0) > gfx.measure(G, "Cobra Music", 17, 0, 0.0));
+    check("tracking adds width", near(gfx.measure(G, "abcd", 12, 1, 1.0) - gfx.measure(G, "abcd", 12, 1, 0.0), 4.0, 0.01));
+    let e1 = gfx.glyph(G, 0, 65, 17);
+    let e2 = gfx.glyph(G, 0, 65, 17);
+    check("glyphs are cached in the atlas", e1.x == e2.x && e1.y == e2.y && e1.w > 8 && e1.top > 8);
+    gfx.text(G, 10, 40, "Test", 17, 0, 0xffffff, 0.0);
+    check("icon draws and is cached", gfx.icon(G, "play", 20, 60, 24, 0xffffff) && gfx.icon(G, "play", 20, 60, 24, 0xffffff) && len(G.icons) == 1);
+    check("missing icon reports false", !gfx.icon(G, "no_such_icon", 20, 60, 24, 0xffffff));
+    gfx.rrect(G, 40, 40, 60, 30, 10, 0x4f8cff);
+    gfx.disc(G, 150, 50, 12, 0xffffff);
+    let before = G.resets;
+    G.x = 1; G.y = 1020; G.rowh = 0;
+    gfx.alloc(G, 100, 50);
+    check("atlas resets itself when full and keeps working", G.resets == before + 1 && gfx.glyph(G, 0, 66, 17).w > 0);
+    game.present();
+    print(fails == 0 ? "ALL PASSED" : f"{fails} FAILED");
+    exit(fails == 0 ? 0 : 1);
+}
+
+fn io_read(p) -> any { return io.read_file(p); }

@@ -1,0 +1,441 @@
+// viz.kc — real-time audio visualisers + the piano-roll score renderer.
+// All analysis comes from the engine (FFT of the audio that is actually playing, at the playback position).
+import std.game;
+import std.music_note;
+import std.system;
+import "ui.kc" as ui;
+import "theme.kc" as theme;
+
+fn modes() -> any { return ["Bars", "Mirror", "Scope", "Radial", "Waterfall", "Rings"]; }
+
+fn new() -> any {
+    var V = {
+        n: 64, bars: [], peaks: [], peak_t: [], edges: [], hist: [], kick: 0.0, avg: 0.0, last_kick: -1.0,
+        vu_l: 0.0, vu_r: 0.0, pk_l: 0.0, pk_r: 0.0, pk_lt: 0.0, pk_rt: 0.0, scope_l: [], scope_r: [], rings: [],
+        have: false, level: 0.0, bass: 0.0, mid: 0.0, high: 0.0, t: 0.0
+    };
+    for (i in 0..V.n) { push(V.bars, 0.0); push(V.peaks, 0.0); push(V.peak_t, 0.0); }
+    // log-spaced band edges (bin indices for a 2048-point FFT at 44.1 kHz: 21.5 Hz per bin)
+    let lo = 30.0;
+    let hi = 16000.0;
+    for (i in 0..V.n + 1) {
+        let f = lo * pow(hi / lo, i / (V.n * 1.0));
+        push(V.edges, int(f / 21.53));
+    }
+    for (i in 0..V.n + 1) {
+        if (i > 0 && V.edges[i] <= V.edges[i - 1]) { V.edges[i] = V.edges[i - 1] + 1; }
+    }
+    return V;
+}
+
+fn reset(V) {
+    for (i in 0..V.n) { V.bars[i] = 0.0; V.peaks[i] = 0.0; }
+    V.hist = [];
+    V.kick = 0.0;
+    V.have = false;
+    V.vu_l = 0.0;
+    V.vu_r = 0.0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// analysis update — call once per frame
+// ---------------------------------------------------------------------------------------------
+fn update(V, E, dt, want_scope) {
+    V.t += dt;
+    var target = [];
+    var have = false;
+    if (E.state == "playing") {
+        let sp = engine_spectrum(E);
+        if (sp != null) {
+            have = true;
+            let db = sp.db;
+            let top = len(db) - 1;
+            for (i in 0..V.n) {
+                var lo = V.edges[i];
+                var hi = V.edges[i + 1];
+                if (hi > top) { hi = top; }
+                if (lo > top) { lo = top; }
+                var m = -120.0;
+                for (k in lo..hi) { if (db[k] > m) { m = db[k]; } }
+                // map -78 dB .. -6 dB to 0..1 with a gentle tilt so highs are visible
+                var v = (m + 78.0) / 72.0 + (i / (V.n * 1.0)) * 0.14;
+                push(target, clamp(v, 0.0, 1.0));
+            }
+        }
+    }
+    V.have = have;
+    var low = 0.0;
+    var mid = 0.0;
+    var high = 0.0;
+    for (i in 0..V.n) {
+        let t = have ? target[i] : 0.0;
+        var v = V.bars[i];
+        if (t > v) { v += (t - v) * clamp(dt * 40.0, 0.0, 1.0); } else { v += (t - v) * clamp(dt * 8.0, 0.0, 1.0); }
+        V.bars[i] = v;
+        if (v > V.peaks[i]) { V.peaks[i] = v; V.peak_t[i] = 0.35; }
+        else {
+            V.peak_t[i] -= dt;
+            if (V.peak_t[i] <= 0.0) { V.peaks[i] = max(v, V.peaks[i] - dt * 0.5); }
+        }
+        if (i < 10) { low += v; } else if (i < 36) { mid += v; } else { high += v; }
+    }
+    V.bass = low / 10.0;
+    V.mid = mid / 26.0;
+    V.high = high / 18.0;
+    // beat pulse from bass energy vs its running average
+    V.avg = V.avg * (1.0 - dt * 2.5) + V.bass * dt * 2.5;
+    if (have && V.bass > V.avg * 1.28 + 0.06 && V.t - V.last_kick > 0.16) {
+        V.kick = 1.0;
+        V.last_kick = V.t;
+        push(V.rings, { r: 20.0, a: 1.0 });
+        if (len(V.rings) > 8) { V.rings = V.rings[1..len(V.rings)]; }
+    }
+    V.kick = max(0.0, V.kick - dt * 3.5);
+    // spectrogram history
+    push(V.hist, have ? target : zeros(V.n));
+    if (len(V.hist) > 320) { V.hist = V.hist[len(V.hist) - 320..len(V.hist)]; }
+    // VU / scope
+    if (want_scope && E.state == "playing") {
+        let sc = engine_scope(E, 1024);
+        if (sc != null) {
+            V.scope_l = sc.l;
+            V.scope_r = sc.r;
+            var sl = 0.0;
+            var sr = 0.0;
+            var pl = 0.0;
+            var pr = 0.0;
+            var i = 0;
+            let n = len(sc.l);
+            while (i < n) {
+                let a = sc.l[i];
+                let b = sc.r[i];
+                sl += a * a;
+                sr += b * b;
+                if (abs(a) > pl) { pl = abs(a); }
+                if (abs(b) > pr) { pr = abs(b); }
+                i += 4;
+            }
+            let cnt = n / 4.0;
+            let rl = sqrt(sl / cnt) * 2.2;
+            let rr = sqrt(sr / cnt) * 2.2;
+            V.vu_l += (rl - V.vu_l) * clamp(dt * 18.0, 0.0, 1.0);
+            V.vu_r += (rr - V.vu_r) * clamp(dt * 18.0, 0.0, 1.0);
+            if (pl > V.pk_l) { V.pk_l = pl; V.pk_lt = 0.8; }
+            if (pr > V.pk_r) { V.pk_r = pr; V.pk_rt = 0.8; }
+        }
+    } else {
+        V.vu_l *= 1.0 - clamp(dt * 6.0, 0.0, 1.0);
+        V.vu_r *= 1.0 - clamp(dt * 6.0, 0.0, 1.0);
+    }
+    V.pk_lt -= dt;
+    V.pk_rt -= dt;
+    if (V.pk_lt < 0.0) { V.pk_l = max(0.0, V.pk_l - dt * 0.8); }
+    if (V.pk_rt < 0.0) { V.pk_r = max(0.0, V.pk_r - dt * 0.8); }
+    // rings
+    var keep = [];
+    for (r in V.rings) {
+        r.r += dt * 220.0;
+        r.a -= dt * 0.9;
+        if (r.a > 0.0) { push(keep, r); }
+    }
+    V.rings = keep;
+}
+
+// thin wrappers so viz.kc does not need to import engine.kc (the engine object is passed in)
+fn engine_spectrum(E) -> any {
+    if (E.an == null) { return null; }
+    let p = E.pos_cache;
+    var tp = (p - E.an_start) / E.an_speed - 0.03;
+    if (tp < 0.0) { tp = 0.0; }
+    if (tp > E.an_len - 0.06) { return null; }
+    return music_note.spectrum(E.an, f"size=2048 start={tp} window=hann");
+}
+
+fn engine_scope(E, count) -> any {
+    if (E.an == null) { return null; }
+    let p = E.pos_cache;
+    var tp = (p - E.an_start) / E.an_speed - 0.02;
+    if (tp < 0.0) { tp = 0.0; }
+    if (tp > E.an_len - 0.05) { return null; }
+    let l = music_note.samples(E.an, f"channel=0 start={tp} count={count}");
+    let r = music_note.samples(E.an, f"channel=1 start={tp} count={count}");
+    return { l: l, r: r };
+}
+
+fn zeros(n) -> any {
+    var a = [];
+    for (i in 0..n) { push(a, 0.0); }
+    return a;
+}
+
+// ---------------------------------------------------------------------------------------------
+// drawing
+// ---------------------------------------------------------------------------------------------
+fn draw_bars(V, T, pal, x, y, w, h, n_draw) {
+    let n = n_draw;
+    let gap = 3;
+    let bw = max(2, idiv(w - (n - 1) * gap, n));
+    let total = n * bw + (n - 1) * gap;
+    let x0 = x + idiv(w - total, 2);
+    for (i in 0..n) {
+        // resample V.bars (64) to n bars
+        let src = i * (V.n - 1) / (n - 1.0);
+        let i0 = int(src);
+        let i1 = min(V.n - 1, i0 + 1);
+        let fr = src - i0;
+        let v = V.bars[i0] * (1.0 - fr) + V.bars[i1] * fr;
+        let pk = V.peaks[i0];
+        let bh = max(2, int(v * (h - 6)));
+        let bx = x0 + i * (bw + gap);
+        let c = theme.viz_color(T, pal, i, n, v);
+        game.rect_grad(bx, y + h - bh, bw, bh, c, game.mix(c, T.bg, 0.55));
+        let py = y + h - int(pk * (h - 6)) - 5;
+        game.rect(bx, py, bw, 3, game.mix(c, 0xffffff, 0.4));
+        // soft reflection
+        let rh = min(int(bh * 0.25), 18);
+        if (rh > 1) { game.rect(bx, y + h + 2, bw, rh, game.mix(T.bg, c, 0.18)); }
+    }
+}
+
+fn draw_mirror(V, T, pal, x, y, w, h, n_draw) {
+    let n = n_draw;
+    let mid = y + idiv(h, 2);
+    let half = idiv(n, 2);
+    let bw = max(2, idiv(w, n) - 2);
+    for (i in 0..half) {
+        let v = V.bars[idiv(i * V.n, half)];
+        let bh = max(2, int(v * (h / 2 - 8)));
+        let c = theme.viz_color(T, pal, i, half, v);
+        let dx = (i + 1) * (bw + 2);
+        let cx = x + idiv(w, 2);
+        game.rect_grad(cx + dx - bw, mid - bh, bw, bh, c, game.mix(c, T.bg, 0.5));
+        game.rect_grad(cx - dx, mid - bh, bw, bh, c, game.mix(c, T.bg, 0.5));
+        game.rect_grad(cx + dx - bw, mid, bw, bh, game.mix(c, T.bg, 0.5), game.mix(c, T.bg, 0.9));
+        game.rect_grad(cx - dx, mid, bw, bh, game.mix(c, T.bg, 0.5), game.mix(c, T.bg, 0.9));
+    }
+    game.rect(x, mid, w, 1, game.mix(T.line, T.accent, 0.4));
+}
+
+fn draw_scope(V, T, pal, x, y, w, h) -> any {
+    let n = len(V.scope_l);
+    let mid = y + idiv(h, 2);
+    game.rect(x, mid, w, 1, T.line);
+    for (g in 1..4) { game.rect(x, y + idiv(h * g, 4), w, 1, game.mix(T.panel, T.line, 0.5)); }
+    if (n < 8) { return 0; }
+    let amp = h * 0.42;
+    let step = max(1, idiv(n, w / 2));
+    var px = x;
+    var pyl = mid;
+    var pyr = mid;
+    var i = 0;
+    var k = 0;
+    let cols = idiv(w, 2);
+    while (k < cols && i < n) {
+        let xx = x + k * 2;
+        let yl = mid - int(V.scope_l[i] * amp * 2.0);
+        let yr = mid - int(V.scope_r[i] * amp * 2.0);
+        if (k > 0) {
+            game.line(px, pyr, xx, yr, game.mix(T.accent, T.bg, 0.35), 3);
+            game.line(px, pyl, xx, yl, T.accent2, 2);
+        }
+        px = xx;
+        pyl = yl;
+        pyr = yr;
+        i += step;
+        k += 1;
+    }
+}
+
+fn draw_radial(V, T, pal, cx, cy, r0, r1, t) {
+    let n = V.n;
+    game.circle(cx, cy, r0 - 4 + int(V.kick * 6), game.mix(T.bg, T.accent, 0.12 + 0.2 * V.kick));
+    game.circle(cx, cy, r0 - 4, T.accent, false);
+    for (i in 0..n) {
+        let v = V.bars[i];
+        let a = (i / (n * 1.0)) * 6.2831853 + t * 0.15;
+        let rr = r0 + v * (r1 - r0) + 2;
+        let c = theme.viz_color(T, pal, i, n, v);
+        game.line(cx + int(cos(a) * r0), cy + int(sin(a) * r0), cx + int(cos(a) * rr), cy + int(sin(a) * rr), c, 4);
+        if (v > 0.5) { game.circle(cx + int(cos(a) * (rr + 6)), cy + int(sin(a) * (rr + 6)), 2, c); }
+    }
+}
+
+fn draw_waterfall(V, T, pal, x, y, w, h) {
+    let cols = len(V.hist);
+    let cw = max(1, idiv(w, 320));
+    let rows = 48;
+    let rh = max(2, idiv(h, rows));
+    let start = max(0, cols - idiv(w, cw));
+    for (c in start..cols) {
+        let col = V.hist[c];
+        let px = x + (c - start) * cw;
+        for (r in 0..rows) {
+            let v = col[idiv(r * V.n, rows)];
+            if (v > 0.06) {
+                let py = y + h - (r + 1) * rh;
+                game.rect(px, py, cw, rh, game.mix(T.bg, theme.viz_color(T, pal, r, rows, v), min(1.0, v * 1.25)));
+            }
+        }
+    }
+}
+
+fn draw_rings(V, T, pal, cx, cy, w, h) {
+    for (r in V.rings) {
+        let c = game.mix(T.bg, theme.viz_color(T, pal, int(r.r) % 64, 64, 0.8), clamp(r.a, 0.0, 1.0) * 0.8);
+        game.circle(cx, cy, int(r.r), c, false);
+        game.circle(cx, cy, int(r.r) + 1, c, false);
+    }
+    let base = int(min(w, h) * 0.12);
+    game.circle(cx, cy, base + int(V.bass * 40) + int(V.kick * 14), theme.viz_color(T, pal, 8, 64, V.bass), true);
+    game.circle(cx, cy, base - 6 + int(V.mid * 30), T.bg);
+    game.circle(cx, cy, base - 12 + int(V.high * 40), theme.viz_color(T, pal, 50, 64, V.high), true);
+}
+
+// stereo VU meter (horizontal): level 0..1
+fn draw_vu(T, x, y, w, h, level, peak) {
+    ui.rrect(x, y, w, h, 3, T.panel2);
+    let lw = int(clamp(level, 0.0, 1.0) * (w - 4));
+    let segs = idiv(w - 4, 6);
+    for (i in 0..segs) {
+        let f = i / (segs * 1.0);
+        if (f * (w - 4) < lw) {
+            var c = T.good;
+            if (f > 0.72) { c = T.warn; }
+            if (f > 0.9) { c = T.bad; }
+            game.rect(x + 2 + i * 6, y + 2, 5, h - 4, c);
+        }
+    }
+    let pk = int(clamp(peak, 0.0, 1.0) * (w - 4));
+    game.rect(x + 2 + pk, y + 1, 2, h - 2, T.text);
+}
+
+// waveform overview used as the seek bar. frac = playback fraction, hover = mouse fraction (or -1)
+fn draw_wavebar(U, E, x, y, w, h, frac, hover) -> any {
+    let T = U.T;
+    let n = len(E.wave_max);
+    let mid = y + idiv(h, 2);
+    if (n == 0) {
+        ui.rrect(x, mid - 2, w, 4, 2, T.line);
+        return 0;
+    }
+    let bw = 3;
+    let cols = idiv(w, bw);
+    let split = int(cols * frac);
+    for (c in 0..cols) {
+        let i = idiv(c * n, cols);
+        let a = abs(E.wave_max[i]);
+        let b = abs(E.wave_min[i]);
+        let v = max(a, b);
+        let bh = max(2, int(v * (h - 2)));
+        let bx = x + c * bw;
+        var col = T.line;
+        if (c < split) { col = game.mix(T.accent2, T.accent, c / (cols * 1.0)); }
+        else if (hover >= 0.0 && c < int(cols * hover)) { col = game.mix(T.line, T.dim, 0.7); }
+        game.rect(bx, mid - idiv(bh, 2), bw - 1, bh, col);
+    }
+    game.rect(x + split * bw - 1, y - 1, 2, h + 2, T.text);
+}
+
+// ---------------------------------------------------------------------------------------------
+// piano roll (score view)
+// ---------------------------------------------------------------------------------------------
+fn build_roll(track_text_or_score) -> any {
+    var ev = music_note.events(track_text_or_score);
+    var buckets = [];
+    var tracks = [];
+    var lo = 127;
+    var hi = 0;
+    var maxs = 0.0;
+    for (e in ev) {
+        if (e.start + e.duration > maxs) { maxs = e.start + e.duration; }
+    }
+    let nb = int(maxs) + 2;
+    for (i in 0..nb) { push(buckets, []); }
+    for (e in ev) {
+        if (!(e.track in tracks)) { push(tracks, e.track); }
+        if (!e.drum) {
+            if (e.midi < lo) { lo = e.midi; }
+            if (e.midi > hi) { hi = e.midi; }
+        }
+        push(buckets[int(e.start)], e);
+    }
+    if (hi <= lo) { lo = 48; hi = 72; }
+    return { buckets: buckets, tracks: tracks, lo: lo, hi: hi, dur: maxs, count: len(ev) };
+}
+
+fn track_color(T, i, n) -> any {
+    return game.hsv(((i * 0.618) % 1.0), 0.6, T.dark ? 0.95 : 0.8);
+}
+
+fn draw_roll(U, R, pos, x, y, w, h, muted_tracks) {
+    let T = U.T;
+    let span = 12.0;
+    let pps = (w - 56) / span;
+    let kx = x + 56;
+    let play_x = kx + int((w - 56) * 0.28);
+    let t0 = pos - 0.28 * span;
+    let t1 = t0 + span;
+    let drum_h = 60;
+    let ph = h - drum_h - 6;
+    let lo = R.lo - 1;
+    let hi = R.hi + 1;
+    let rows = hi - lo + 1;
+    let rh = max(3.0, ph / (rows * 1.0));
+    ui.rrect(x, y, w, h, 8, T.panel);
+    game.clip(x + 1, y + 1, w - 2, h - 2);
+    // pitch grid + piano strip
+    for (m in lo..hi + 1) {
+        let yy = y + 4 + int((hi - m) * rh);
+        let black = (m % 12 == 1 || m % 12 == 3 || m % 12 == 6 || m % 12 == 8 || m % 12 == 10);
+        if (black) { game.rect(kx, yy, w - 56, int(rh), game.mix(T.panel, T.bg, 0.35)); }
+        game.rect(x + 6, yy, 44, max(1, int(rh) - 1), black ? 0x2a2a30 : 0xd8d8de);
+        if (m % 12 == 0) {
+            ui.text(x + 6, yy + int(rh / 2) - 4, "C" + (idiv(m, 12) - 1), 0x202028, 1);
+            game.rect(kx, yy + int(rh) - 1, w - 56, 1, T.line);
+        }
+    }
+    // beat lines every second
+    var sec = int(t0);
+    while (sec <= t1) {
+        if (sec >= 0) {
+            let bx = kx + int((sec - t0) * pps);
+            game.rect(bx, y + 2, 1, ph + 4, game.mix(T.panel, T.line, 0.8));
+        }
+        sec += 1;
+    }
+    // notes
+    let b0 = max(0, int(t0) - 6);
+    let b1 = min(len(R.buckets) - 1, int(t1) + 1);
+    let ntr = len(R.tracks);
+    var active = [];
+    for (b in b0..b1 + 1) {
+        for (e in R.buckets[b]) {
+            let ex = e.start;
+            let ew = e.duration;
+            if (ex + ew >= t0 && ex <= t1) {
+                var ti = 0;
+                for (k in 0..ntr) { if (R.tracks[k] == e.track) { ti = k; } }
+                var c = track_color(T, ti, ntr);
+                let on = ex <= pos && pos < ex + ew;
+                let nx = kx + int((ex - t0) * pps);
+                let nw = max(3, int(ew * pps) - 1);
+                if (e.drum) {
+                    let dy = y + h - drum_h + 4 + (e.midi % 6) * 9;
+                    ui.rrect(nx, dy, max(4, min(nw, 14)), 7, 3, on ? 0xffffff : c);
+                } else {
+                    let ny = y + 4 + int((hi - e.midi) * rh);
+                    ui.rrect(nx, ny, nw, max(3, int(rh) - 1), 2, on ? game.mix(c, 0xffffff, 0.55) : c);
+                    if (on) {
+                        game.rect(x + 6, ny, 44, max(1, int(rh) - 1), c);
+                    }
+                }
+            }
+        }
+    }
+    game.rect(kx, y + h - drum_h - 2, w - 56, 1, T.line);
+    ui.text(kx + 6, y + h - drum_h + 0, "drums / percussion", T.dim, 1);
+    // playhead
+    game.rect(play_x, y + 2, 2, h - 4, T.accent);
+    game.triangle(play_x - 6, y + 2, play_x + 8, y + 2, play_x + 1, y + 10, T.accent);
+    game.clip();
+}

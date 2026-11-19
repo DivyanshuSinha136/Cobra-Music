@@ -1,0 +1,40 @@
+// theme.kc — colour themes for Cobra Music Studio.
+// Every colour is an opaque 0xRRGGBB integer. A theme is a plain object so views can read T.accent etc.
+import std.game;
+
+fn names() -> any {
+    return ["Midnight", "Neon", "Sunset", "Forest", "Paper"];
+}
+
+fn make(name) -> any {
+    if (name == "Neon") {
+        return { name: "Neon", dark: true, bg: 0x07060f, side: 0x0b0918, panel: 0x110e25, panel2: 0x1a1636, line: 0x2c2556,
+                 text: 0xf3f0ff, dim: 0x8d86c6, accent: 0xff2fb9, accent2: 0x2ff3ff, good: 0x39ff9c, warn: 0xffc83a, bad: 0xff4b6e, hue: 0.88 };
+    }
+    if (name == "Sunset") {
+        return { name: "Sunset", dark: true, bg: 0x140c12, side: 0x1a0f17, panel: 0x22141d, panel2: 0x2e1c28, line: 0x4a2c3b,
+                 text: 0xfff1e6, dim: 0xc79a8f, accent: 0xff7a45, accent2: 0xffc857, good: 0x7bdc8c, warn: 0xffc857, bad: 0xff5d73, hue: 0.05 };
+    }
+    if (name == "Forest") {
+        return { name: "Forest", dark: true, bg: 0x08110d, side: 0x0c1812, panel: 0x11211a, panel2: 0x183026, line: 0x2a4a3b,
+                 text: 0xe9fff3, dim: 0x82ad98, accent: 0x3ddc84, accent2: 0xb8f06a, good: 0x3ddc84, warn: 0xe8c547, bad: 0xff6b6b, hue: 0.40 };
+    }
+    if (name == "Paper") {
+        return { name: "Paper", dark: false, bg: 0xf1efe9, side: 0xe6e3da, panel: 0xfbfaf6, panel2: 0xe9e6dd, line: 0xcfcabd,
+                 text: 0x23211d, dim: 0x7a756a, accent: 0xd1495b, accent2: 0x2e86ab, good: 0x2f9e6b, warn: 0xc98a12, bad: 0xc0392b, hue: 0.97 };
+    }
+    return { name: "Midnight", dark: true, bg: 0x0b1020, side: 0x0e1428, panel: 0x131b33, panel2: 0x1b2542, line: 0x2a3760,
+             text: 0xeaf0ff, dim: 0x8a98c4, accent: 0x4f8cff, accent2: 0x35e0c2, good: 0x35e0c2, warn: 0xffc24a, bad: 0xff5470, hue: 0.60 };
+}
+
+// Colour of bar i of n in a visualiser palette (0 accent gradient, 1 rainbow, 2 fire, 3 ice, 4 mono)
+fn viz_color(T, pal, i, n, level) -> any {
+    let f = n > 1 ? i / (n - 1.0) : 0.0;
+    if (pal == 1) { return game.hsv(f * 0.85, 0.75, 0.55 + 0.45 * level); }
+    if (pal == 2) { return game.hsv(0.0 + 0.13 * (0.3 + 0.7 * level), 0.9, 0.5 + 0.5 * level); }
+    if (pal == 3) { return game.hsv(0.5 + 0.12 * f, 0.55 - 0.25 * level, 0.6 + 0.4 * level); }
+    if (pal == 4) { let v = 0.35 + 0.65 * level; return game.rgb(int(235 * v), int(235 * v), int(240 * v)); }
+    return game.mix(T.accent2, T.accent, f);
+}
+
+fn palette_names() -> any { return ["Theme", "Rainbow", "Fire", "Ice", "Mono"]; }

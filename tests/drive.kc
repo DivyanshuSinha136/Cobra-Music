@@ -1,0 +1,36 @@
+// Headless driver: builds the app, plays a track, walks every view and writes screenshots.
+import std.game;
+import std.system;
+import "../src/app.kc" as app;
+import "../src/core.kc" as core;
+import "../src/library.kc" as lib;
+import "../src/engine.kc" as engine;
+
+fn step(S, n) {
+    for (i in 0..n) { game.poll(); app.frame(S, 0.033); game.present(); }
+}
+
+fn main() {
+    game.headless(true);
+    game.window("t", 1280, 720);
+    game.mode("2d");
+    let dir = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+    let S = app.create(dir, 1280, 720);
+    
+    step(S, 3);
+    game.screenshot("/tmp/shot_library.png");
+    print("tracks", len(S.tracks), "silent", S.E.silent, S.E.audio_note);
+    let list = lib.view_list(S);
+    core.play_ctx(S, list[0], list);
+    var n = 0;
+    while (S.loading != null && n < 600) { step(S, 1); system.sleep(0.05); n += 1; }
+    print("loaded", S.E.track != null, "dur", S.E.dur, "state", S.E.state, "waited", n);
+    step(S, 60);
+    print("pos", S.E.pos_cache, "bars", S.V.bars[3], S.V.bass);
+    game.screenshot("/tmp/shot_playing.png");
+    for (v in ["viz", "eq", "score", "queue", "playlists", "settings"]) {
+        S.view = v; if (v == "queue") { core.set_theme(S, "Neon"); }
+        step(S, 20);
+        game.screenshot("/tmp/shot_" + v + ".png");
+    }
+}

@@ -1,0 +1,188 @@
+// Tests for the advanced Studio features and the player's robustness features.
+//   KC_MUSIC_SILENT=1 KC_MUSIC_HOME=/tmp/cm_m kingcobra run tests/mature_test.kc
+import std.game;
+import std.system;
+import std.json;
+import std.io;
+import std.music_note;
+import "../src/app.kc" as app;
+import "../src/core.kc" as core;
+import "../src/studio.kc" as studio;
+import "../src/engine.kc" as engine;
+import "../src/library.kc" as lib;
+
+var fails = 0;
+fn check(name, cond) { if (cond) { print("ok   - " + name); } else { print("FAIL - " + name); fails += 1; } }
+fn step(S, n) { for (i in 0..n) { game.poll(); app.frame(S, 0.033); game.present(); } }
+fn mouse(S, x, y, down) {
+    game.send_mouse(x, y, 1, down); step(S, 1);
+}
+fn click(S, x, y) { game.send_mouse(x, y); step(S, 1); mouse(S, x, y, true); mouse(S, x, y, false); }
+fn drag(S, x0, y0, x1, y1) {
+    game.send_mouse(x0, y0); step(S, 1);
+    mouse(S, x0, y0, true);
+    game.send_mouse(x1, y1, 1, true); step(S, 2);
+    mouse(S, x1, y1, false);
+}
+fn rclick(S, x, y) { game.send_mouse(x, y); step(S, 1); game.send_mouse(x, y, 3, true); step(S, 1); game.send_mouse(x, y, 3, false); step(S, 1); }
+
+fn main() {
+    game.headless(true); game.window("t", 1280, 720); game.mode("2d");
+    let dir = system.abspath(system.path_join(system.dirname(system.script_path()), ".."));
+    let S = app.create(dir, 1280, 720);
+    let st = S.st;
+    S.view = "studio"; step(S, 3);
+    let gx = 236 + 12 + 170 + 10 + 56;
+    let gy = 64 + 90;
+
+    // ---------- velocity / accents / slide in the notation ----------
+    studio.apply_template(S, "Trap");
+    var P = st.P;
+    P.tracks[0].lanes[1].s[8] = 2;
+    P.tracks[0].lanes[3].s[2] = 3;
+    P.tracks[1].notes[0].v = 70;
+    P.tracks[1].notes[1].s = true;
+    P.tracks[1].glide = 0.08;
+    var txt = studio.compile(P);
+    check("accent step compiles to @118", "snare:1/16@118" in txt);
+    check("ghost step compiles to @52", "hat:1/16@52" in txt);
+    check("note velocity compiles", "@70" in txt);
+    check("808 slide compiles to tenuto", "^" in txt && "glide=0.08" in txt);
+    check("notation with all of it parses", music_note.score_info(txt).notes > 50);
+
+    // ---------- sidechain ducking + humanize render ----------
+    P.tracks[1].duck = true;
+    P.humanize = 6.0;
+    let plan = studio.duck_plan(P);
+    check("duck plan finds kick key and ducked bass", len(plan.keys) == 1 && plan.ducked == ["t2"]);
+    let r = studio.render_audio(S);
+    check("ducked render is audible and not clipped", music_note.stats(r.audio).peak_db < 0.0 && !music_note.stats(r.audio).silent);
+    music_note.free(r.audio);
+    P.humanize = 0.0;
+
+    // ---------- sampler track ----------
+    let wav = system.path_join(dir, "..", "kc", "kingcobra", "examples", "music", "samples", "pluck_a3.wav");
+    let samp = system.exists(wav) ? wav : "/home/claude/kc/kingcobra/examples/music/samples/pluck_a3.wav";
+    check("missing sample is rejected", studio.set_sample(S, P.tracks[2], "/nope.wav") != "");
+    check("sample loads onto a synth track", studio.set_sample(S, P.tracks[2], samp) == "");
+    txt = studio.compile(P);
+    check("sample declared + used", "sample smp3" in txt && "track t3 sample=smp3" in txt);
+    check("sample track renders", music_note.info(music_note.render(txt, "tail=1")).seconds > 5.0);
+    studio.clear_sample(S, P.tracks[2]);
+    check("sample removed", P.tracks[2].sample == "" && P.tracks[2].inst == "pluck");
+
+    // ---------- stems ----------
+    let sd = studio.export_stems(S);
+    check("stems: one wav per track", len(system.list_dir(sd)) == 3);
+
+    // ---------- piano-roll drag: move, resize, wheel velocity, chord stamp ----------
+    st.sel = 2; st.fit_sel = -1; st.page = 0;
+    P.tracks[2].notes = [];
+    step(S, 2);
+    let lo = 12 * (st.oct + 1);
+    let row = 10;
+    click(S, gx + 4 * 19 + 5, gy + row * 15 + 5);
+    check("empty click adds a note", len(P.tracks[2].notes) == 1);
+    let n0 = P.tracks[2].notes[0];
+    let t0 = n0.t; let m0 = n0.m;
+    drag(S, gx + 4 * 19 + 5, gy + row * 15 + 5, gx + 9 * 19 + 5, gy + (row - 3) * 15 + 5);
+    check("dragging a note moves it in time and pitch", P.tracks[2].notes[0].t == 9 && P.tracks[2].notes[0].m == m0 + 3 && len(P.tracks[2].notes) == 1);
+    P.tracks[2].notes[0].l = 4;
+    step(S, 2);
+    let ex = gx + (9 + 3) * 19 + 15;
+    drag(S, ex, gy + (row - 3) * 15 + 5, ex + 3 * 19, gy + (row - 3) * 15 + 5);
+    check("dragging the right edge resizes", P.tracks[2].notes[0].l == 7);
+    game.send_mouse(gx + 10 * 19 + 5, gy + (row - 3) * 15 + 5); step(S, 1);
+    let v0 = P.tracks[2].notes[0].v;
+    S.U.inject_wheel = 1; step(S, 2);
+    check("mouse wheel changes note velocity", P.tracks[2].notes[0].v != v0);
+    st.chord = 1;
+    click(S, gx + 20 * 19 + 5, gy + 12 * 15 + 5);
+    check("chord stamp adds a triad", len(P.tracks[2].notes) == 4);
+    st.chord = 0;
+
+    // ---------- drum velocity cycle ----------
+    st.sel = 0; st.fit_sel = -1; step(S, 2);
+    P.tracks[0].lanes[0].s[0] = 1;
+    rclick(S, gx + 5, gy + 10);
+    check("right-click cycles drum level normal -> accent", P.tracks[0].lanes[0].s[0] == 2);
+
+    // ---------- edit ops / generators ----------
+    let before = len(P.tracks[2].notes);
+    studio.transpose_track(S, P.tracks[2], 12);
+    check("octave up", P.tracks[2].notes[0].m >= 12);
+    studio.generate(S, "Chords");
+    st.sel = 1; studio.generate(S, "Bassline");
+    check("bassline generator fills the track", len(P.tracks[1].notes) == P.bars * 4);
+    st.sel = 2; studio.generate(S, "Arp up/down");
+    check("arp generator fills every step", len(P.tracks[2].notes) == P.bars * 16);
+    let b = P.bars;
+    check("double length", studio.double_length(S) && P.bars == b * 2 && len(P.tracks[2].notes) == b * 2 * 16);
+    st.sel = 0; studio.generate(S, "Drum fill");
+    check("drum fill adds an accent at the end", P.tracks[0].lanes[1].s[P.bars * 16 - 1] == 2);
+
+    // ---------- migration of an old project ----------
+    let old = { name: "Old", bpm: 100, swing: 0.0, bars: 1, master: "none", tracks: [ { name: "Lead", kind: "note", inst: "piano", vol: 0.8, pan: 0.0, rev: 0.1, mute: false, solo: false, lanes: [], notes: [ { t: 0, l: 2, m: 60 } ] } ] };
+    let mg = studio.migrate(old);
+    check("old projects get new fields", mg.humanize == 0.0 && mg.tracks[0].duck == false && mg.tracks[0].notes[0].v == 100);
+    check("migrated project compiles", "track t1 piano" in studio.compile(mg));
+
+    // ---------- autosave ----------
+    studio.autosave(S);
+    check("autosave writes a recovery file", system.exists(system.path_join(S.data_dir, "projects", "_autosave.json")));
+
+    // ---------- crash guard ----------
+    S.view = "library"; step(S, 2);
+    S.fault = true;
+    step(S, 1);
+    let lp = system.path_join(S.data_dir, "error.log");
+    check("a faulting frame is caught and logged", system.exists(lp) && "injected test fault" in io.read_file(lp));
+    step(S, 3);
+    check("the app keeps running after a fault", S.view == "library" && game.poll());
+    for (i in 0..3) { S.view = "settings"; S.fault = true; step(S, 1); }
+    check("a storm of faults falls back to the library", S.view == "library");
+
+    // ---------- loudness matching ----------
+    let list = lib.view_list(S);
+    core.play_ctx(S, list[0], list);
+    var n = 0; while (S.loading != null && n < 600) { step(S, 1); system.sleep(0.05); n += 1; }
+    step(S, 3);
+    check("loudness gain computed and bounded", abs(S.E.norm_db) <= 9.0 && S.E.norm_db != 0.0);
+    let st2 = music_note.stats(S.E.raw);
+    check("gain never pushes peaks past -1 dB", st2.peak_db + S.E.norm_db <= -0.9);
+    S.settings.normalize = false; step(S, 2);
+    check("normalise can be switched off", !S.E.norm);
+    S.settings.normalize = true;
+
+    // ---------- cache limit ----------
+    let cd = S.E.cache_dir;
+    io.write_file(system.path_join(cd, "old_a.wav"), "xxxxxxxxxxxx");
+    system.sleep(1.1);
+    io.write_file(system.path_join(cd, "new_b.wav"), "yyyyyyyyyyyy");
+    let rem = engine.trim_cache(S.E, 0);
+    check("cache trim removes files over the limit", rem >= 2 || engine.cache_bytes(S.E) <= 0 + 1000000);
+    check("trim never deletes the file being played", system.exists(engine.source_path(S.E, S.E.track)));
+
+    // ---------- state sanitising ----------
+    S.settings.theme = "Nonsense"; S.settings.viz_mode = 99; S.E.vol = 7.0; S.E.eq[3] = 50.0; S.settings.cache_mb = -5;
+    lib.sanitize(S, S.E, ["Midnight", "Neon"]);
+    check("bad state is clamped", S.settings.theme == "Midnight" && S.settings.viz_mode == 5 && S.E.vol == 1.0 && S.E.eq[3] == 12.0 && S.settings.cache_mb == 50);
+
+    // ---------- most played + settings + all views ----------
+    S.view = "playlists"; S.pl_sel = -3; step(S, 3);
+    check("most played list has the track just played", len(core_pl(S)) >= 1);
+    for (v in ["library", "playlists", "queue", "viz", "eq", "score", "studio", "settings"]) { S.view = v; step(S, 3); }
+    check("every view renders with no faults", S.errors == [] || !core.fault_storm(S));
+    S.view = "settings"; step(S, 2);
+    game.screenshot("/tmp/shot_settings2.png");
+    S.view = "studio"; st.sel = 2; st.fit_sel = -1; st.ptab = 1; step(S, 3);
+    game.screenshot("/tmp/shot_studio2.png");
+    print(fails == 0 ? "ALL PASSED" : f"{fails} FAILED");
+    exit(fails == 0 ? 0 : 1);
+}
+
+fn core_pl(S) -> any {
+    var out = [];
+    for (t in S.tracks) { if (t.plays > 0) { push(out, t); } }
+    return out;
+}

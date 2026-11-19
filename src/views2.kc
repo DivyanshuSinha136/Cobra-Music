@@ -1,0 +1,349 @@
+// views2.kc — Visualizer, Equalizer, Score (piano roll), Settings and the track-info modal.
+import std.game;
+import std.system;
+import "ui.kc" as ui;
+import "theme.kc" as theme;
+import "viz.kc" as viz;
+import "core.kc" as core;
+import "engine.kc" as engine;
+import "library.kc" as lib;
+
+// ---------------------------------------------------------------------------------------------
+// Visualizer
+// ---------------------------------------------------------------------------------------------
+fn view_viz(S, x, y, w, h) {
+    let U = S.U;
+    let T = S.T;
+    let V = S.V;
+    let st = S.settings;
+    let modes = viz.modes();
+    st.viz_mode = ui.segmented(U, "viz/mode", x + 20, y + 8, 440, 30, modes, st.viz_mode);
+    let pn = theme.palette_names();
+    var cx = x + 480;
+    for (i in 0..len(pn)) {
+        if (ui.chip(U, "viz/pal" + i, cx, y + 11, pn[i], st.viz_pal == i)) { st.viz_pal = i; }
+        cx += ui.chip_w(pn[i]) + 6;
+    }
+    let px = x + 20;
+    let py = y + 48;
+    let pw = w - 40;
+    let ph = h - 120;
+    ui.rrect_border(px, py, pw, ph, 12, game.mix(T.bg, T.panel, 0.6), 1, T.line);
+    game.clip(px + 2, py + 2, pw - 4, ph - 4);
+    let m = st.viz_mode;
+    if (m == 0) { viz.draw_bars(V, T, st.viz_pal, px + 16, py + 16, pw - 32, ph - 60, 48); }
+    else if (m == 1) { viz.draw_mirror(V, T, st.viz_pal, px + 16, py + 10, pw - 32, ph - 20, 64); }
+    else if (m == 2) { viz.draw_scope(V, T, st.viz_pal, px + 10, py + 10, pw - 20, ph - 20); }
+    else if (m == 3) { viz.draw_radial(V, T, st.viz_pal, px + idiv(pw, 2), py + idiv(ph, 2), int(ph * 0.2), int(ph * 0.46), U.t); }
+    else if (m == 4) { viz.draw_waterfall(V, T, st.viz_pal, px + 8, py + 8, pw - 16, ph - 16); }
+    else { viz.draw_rings(V, T, st.viz_pal, px + idiv(pw, 2), py + idiv(ph, 2), pw, ph); }
+    game.clip();
+    let t = S.E.track;
+    if (t != null) {
+        ui.text(px + 20, py + ph - 28, ui.fit(t.title + "  -  " + t.artist, pw - 300, 1), T.dim, 1);
+    } else {
+        ui.text_c(px + idiv(pw, 2), py + idiv(ph, 2) - 8, "Play something to see it move", T.dim, 2);
+    }
+    // VU meters
+    let vy = y + h - 60;
+    ui.text(x + 24, vy + 4, "L", T.dim, 1);
+    viz.draw_vu(T, x + 44, vy, 300, 14, V.vu_l, V.pk_l);
+    ui.text(x + 24, vy + 24, "R", T.dim, 1);
+    viz.draw_vu(T, x + 44, vy + 20, 300, 14, V.vu_r, V.pk_r);
+    ui.text(x + 370, vy + 4, f"bass {int(V.bass * 100)}%  mid {int(V.mid * 100)}%  high {int(V.high * 100)}%", T.dim, 1);
+    ui.text(x + 370, vy + 24, "Visualisers analyse the audio that is actually playing (FFT, 2048 pts)", T.dim, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Equalizer + effects
+// ---------------------------------------------------------------------------------------------
+fn presets() -> any {
+    return [
+        ["Flat",       [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+        ["Bass Boost", [6, 5, 4, 2, 0, 0, 0, 0, 0, 0]],
+        ["Treble",     [0, 0, 0, 0, 0, 1, 2, 4, 5, 6]],
+        ["Vocal",      [-2, -2, -1, 1, 3, 4, 3, 1, 0, -1]],
+        ["Rock",       [5, 4, 2, -1, -2, 1, 3, 4, 5, 5]],
+        ["Electronic", [5, 4, 1, 0, -2, 2, 1, 3, 5, 5]],
+        ["Lo-fi",      [2, 2, 1, 0, 0, -2, -4, -6, -8, -10]],
+        ["Loudness",   [6, 4, 0, 0, -1, 0, -1, 0, 3, 5]]
+    ];
+}
+
+fn eq_curve(U, E, x, y, w, h) {
+    let T = U.T;
+    ui.rrect_border(x, y, w, h, 8, T.panel, 1, T.line);
+    let mid = y + idiv(h, 2);
+    for (g in 1..4) { game.rect(x + 4, y + idiv(h * g, 4), w - 8, 1, game.mix(T.panel, T.line, 0.6)); }
+    game.rect(x + 4, mid, w - 8, 1, T.dim);
+    var px = x;
+    var py = mid;
+    for (k in 0..w - 8) {
+        let f = k / ((w - 9) * 1.0) * 9.0;
+        let i = min(8, int(f));
+        let fr = f - i;
+        let s = fr * fr * (3.0 - 2.0 * fr);
+        let g = E.eq[i] * (1.0 - s) + E.eq[i + 1] * s + E.bass * max(0.0, 1.0 - f / 2.0);
+        let yy = mid - int(g / 12.0 * (h / 2 - 6));
+        if (k > 0) { game.line(px, py, x + 4 + k, yy, T.accent, 2); }
+        px = x + 4 + k;
+        py = yy;
+    }
+}
+
+fn view_eq(S, x, y, w, h) {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    var changed = false;
+    // presets
+    var cx = x + 20;
+    let ps = presets();
+    for (p in ps) {
+        if (ui.chip(U, "eqp/" + p[0], cx, y + 8, p[0], false)) {
+            for (i in 0..10) { E.eq[i] = p[1][i] * 1.0; }
+            changed = true;
+            ui.toast(U, "Preset: " + p[0]);
+        }
+        cx += ui.chip_w(p[0]) + 6;
+    }
+    // curve + spectrum backdrop
+    let gx = x + 20;
+    let gw = 640;
+    let gy = y + 44;
+    eq_curve(U, E, gx, gy, gw, 100);
+    for (i in 0..32) {
+        let v = S.V.bars[i * 2];
+        game.rect(gx + 6 + i * 19, gy + 96 - int(v * 40), 14, int(v * 40), game.mix(T.panel, T.accent2, 0.25));
+    }
+    // sliders
+    let names = ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+    let sy = gy + 170;
+    ui.rrect_border(gx, gy + 110, gw, 280, 8, T.panel, 1, T.line);
+    for (i in 0..10) {
+        let sx = gx + 40 + i * 62;
+        let nv = ui.vslider(U, "eq/" + i, sx, sy, 170, E.eq[i], -12.0, 12.0, 0.0);
+        if (nv != E.eq[i]) { E.eq[i] = nv; changed = true; }
+        ui.text_c(sx, gy + 124, sprintf("%+.1f", E.eq[i]), E.eq[i] == 0.0 ? T.dim : T.accent, 1);
+        ui.text_c(sx, sy + 188, names[i], T.dim, 1);
+    }
+    ui.text(gx + 12, gy + 372, "dB per band - double-click a slider to reset it", T.dim, 1);
+    // effects column
+    let ex = x + 690;
+    let ew = w - 710;
+    ui.panel(U, ex, gy, ew, 390, 8);
+    ui.label(ex + 18, gy + 14, "EFFECTS", T.dim);
+    var yy = gy + 44;
+    var v = 0.0;
+    ui.text(ex + 18, yy - 14, "Pre-amp", T.text, 1); ui.text_r(ex + ew - 18, yy - 14, sprintf("%+.1f dB", E.preamp), T.dim, 1);
+    v = ui.slider(U, "fx/pre", ex + 18, yy + 12, ew - 36, E.preamp, -12.0, 12.0);
+    if (v != E.preamp) { E.preamp = v; changed = true; }
+    yy += 52;
+    ui.text(ex + 18, yy - 14, "Bass shelf", T.text, 1); ui.text_r(ex + ew - 18, yy - 14, sprintf("%+.1f dB", E.bass), T.dim, 1);
+    v = ui.slider(U, "fx/bass", ex + 18, yy + 12, ew - 36, E.bass, -10.0, 10.0);
+    if (v != E.bass) { E.bass = v; changed = true; }
+    yy += 52;
+    ui.text(ex + 18, yy - 14, "Stereo width", T.text, 1); ui.text_r(ex + ew - 18, yy - 14, sprintf("%.2f", E.width), T.dim, 1);
+    v = ui.slider(U, "fx/width", ex + 18, yy + 12, ew - 36, E.width, 0.0, 2.0);
+    if (v != E.width) { E.width = v; changed = true; }
+    yy += 52;
+    ui.text(ex + 18, yy - 14, "Reverb", T.text, 1); ui.text_r(ex + ew - 18, yy - 14, sprintf("%d%%", int(E.reverb * 100)), T.dim, 1);
+    v = ui.slider(U, "fx/rev", ex + 18, yy + 12, ew - 36, E.reverb, 0.0, 0.6);
+    if (v != E.reverb) { E.reverb = v; changed = true; }
+    yy += 52;
+    ui.text(ex + 18, yy - 14, "Speed (pitch kept)", T.text, 1); ui.text_r(ex + ew - 18, yy - 14, sprintf("%.2fx", E.speed), T.dim, 1);
+    v = ui.slider(U, "fx/speed", ex + 18, yy + 12, ew - 36, E.speed, 0.5, 1.5);
+    if (v != E.speed) { E.speed = v; changed = true; }
+    yy += 46;
+    ui.text(ex + 18, yy, "Compressor", T.text, 1);
+    if (ui.toggle(U, "fx/comp", ex + ew - 56, yy - 6, E.comp)) { E.comp = !E.comp; changed = true; }
+    yy += 30;
+    ui.text(ex + 18, yy, "Limiter", T.text, 1);
+    if (ui.toggle(U, "fx/lim", ex + ew - 56, yy - 6, E.limiter)) { E.limiter = !E.limiter; changed = true; }
+    if (ui.button(U, "fx/reset", ex + 18, gy + 352, 110, 28, "Reset all", "ghost")) {
+        for (i in 0..10) { E.eq[i] = 0.0; }
+        E.preamp = 0.0; E.bass = 0.0; E.width = 1.0; E.reverb = 0.0; E.speed = 1.0; E.comp = false;
+        changed = true;
+    }
+    if (ui.button(U, "fx/export", ex + 140, gy + 352, ew - 158, 28, "Export WAV", "primary")) {
+        let t = E.track;
+        if (t == null) { ui.toast(U, "Nothing loaded"); }
+        else {
+            let home = system.home_dir();
+            let dir = home != null ? home : system.temp_dir();
+            let out = system.path_join(dir, lib.slug(t.title) + "_cobra.wav");
+            if (engine.export_wav(E, out)) { ui.toast(U, "Saved " + out); } else { ui.toast(U, "Export failed"); }
+        }
+    }
+    if (changed) { engine.changed(E); }
+    ui.text(x + 20, y + h - 22, "Changes are applied to the playing audio when you release a control.", T.dim, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Score (piano roll)
+// ---------------------------------------------------------------------------------------------
+fn view_score(S, x, y, w, h) -> any {
+    let U = S.U;
+    let T = S.T;
+    let t = S.E.track;
+    if (t == null) {
+        ui.text_c(x + idiv(w, 2), y + 160, "Play a generated or .kcm track", T.dim, 2);
+        ui.text_c(x + idiv(w, 2), y + 192, "to watch its notation scroll by", T.dim, 1);
+        return 0;
+    }
+    if (S.roll == null) {
+        ui.text_c(x + idiv(w, 2), y + 160, "No notation for audio files", T.dim, 2);
+        ui.text_c(x + idiv(w, 2), y + 192, S.rolled_err != "" ? S.rolled_err : "Only .kcm scores and generated tracks have notes", T.dim, 1);
+        return 0;
+    }
+    let R = S.roll;
+    ui.text(x + 24, y + 12, f"{R.count} notes", T.dim, 1);
+    var cx = x + 130;
+    for (i in 0..len(R.tracks)) {
+        let c = viz.track_color(T, i, len(R.tracks));
+        game.rect(cx, y + 11, 10, 10, c);
+        ui.text(cx + 14, y + 12, R.tracks[i], T.text, 1);
+        cx += ui.tw(R.tracks[i], 1) + 34;
+    }
+    viz.draw_roll(U, R, S.E.pos_cache, x + 20, y + 36, w - 40, h - 52, S.roll_mute);
+}
+
+// two-column key/value row (proportional fonts do not line up with spaces)
+fn kv(U, T, x, y, k, v) {
+    ui.text(x, y, k, T.dim, 1);
+    ui.text_fit(x + 104, y, 330, v, T.text, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------
+fn view_settings(S, x, y, w, h) {
+    let U = S.U;
+    let T = S.T;
+    let E = S.E;
+    let st = S.settings;
+    let colw = idiv(w - 60, 2);
+    // theme
+    ui.panel(U, x + 20, y + 8, colw, 120, 10);
+    ui.label(x + 38, y + 22, "THEME", T.dim);
+    var cx = x + 38;
+    let names = theme.names();
+    for (n in names) {
+        if (ui.chip(U, "th/" + n, cx, y + 46, n, st.theme == n)) { core.set_theme(S, n); }
+        cx += ui.chip_w(n) + 6;
+    }
+    ui.text(x + 38, y + 86, "Palettes for the visualiser live in its own tab.", T.dim, 1);
+    // playback
+    ui.panel(U, x + 20, y + 140, colw, 250, 10);
+    ui.label(x + 38, y + 154, "PLAYBACK", T.dim);
+    var yy = y + 184;
+    ui.text(x + 38, yy, "Autoplay next track", T.text, 1);
+    if (ui.toggle(U, "s/auto", x + colw - 40, yy - 6, st.autoplay_next)) { st.autoplay_next = !st.autoplay_next; }
+    yy += 34;
+    ui.text(x + 38, yy, "Match loudness between tracks", T.text, 1);
+    if (ui.toggle(U, "s/norm", x + colw - 40, yy - 6, st.normalize)) { st.normalize = !st.normalize; E.norm = st.normalize; engine.changed(E); }
+    yy += 34;
+    ui.text(x + 38, yy, "Mini visualiser in player bar", T.text, 1);
+    if (ui.toggle(U, "s/mini", x + colw - 40, yy - 6, st.show_mini_viz)) { st.show_mini_viz = !st.show_mini_viz; }
+    yy += 34;
+    ui.text(x + 38, yy, "Invert scroll wheel", T.text, 1);
+    if (ui.toggle(U, "s/inv", x + colw - 40, yy - 6, st.invert_scroll)) { st.invert_scroll = !st.invert_scroll; U.invert_scroll = st.invert_scroll; }
+    yy += 38;
+    ui.text(x + 38, yy, "Sleep timer", T.text, 1);
+    let opts = [["Off", 0], ["15m", 15], ["30m", 30], ["60m", 60], ["90m", 90]];
+    var sx = x + 38;
+    yy += 18;
+    for (o in opts) {
+        if (ui.chip(U, "sl/" + o[1], sx, yy, o[0], st.sleep_min == o[1])) { core.set_sleep(S, o[1]); }
+        sx += ui.chip_w(o[0]) + 6;
+    }
+    // shortcuts
+    ui.panel(U, x + 20, y + 402, colw, 126, 10);
+    ui.label(x + 38, y + 416, "SHORTCUTS", T.dim);
+    ui.text(x + 38, y + 436, "Space play/pause   Left/Right seek 5s", T.text, 1);
+    ui.text(x + 38, y + 452, "Up/Down volume   N/P track   S shuffle   R repeat", T.text, 1);
+    ui.text(x + 38, y + 468, "M mute   F favorite   1-8 switch view   / search", T.text, 1);
+    ui.text(x + 38, y + 484, "Right-click a track for more. Esc closes menus.", T.text, 1);
+    ui.text_fit(x + 38, y + 506, colw - 36, "Data: " + S.data_dir, T.dim, 1);
+    // folders
+    let rx = x + 40 + colw;
+    ui.panel(U, rx, y + 8, colw, 230, 10);
+    ui.label(rx + 18, y + 22, "LIBRARY FOLDERS", T.dim);
+    ui.text_r(rx + colw - 18, y + 22, ".wav  .kcm  (+ mp3/flac/ogg with ffmpeg)", T.dim, 1);
+    var fy = y + 46;
+    for (i in 0..len(st.folders)) {
+        ui.text_fit(rx + 18, fy + 6, colw - 70, st.folders[i], T.text, 1);
+        if (ui.icon_button(U, "fd/" + i, rx + colw - 44, fy, 26, "trash", false, "Remove folder")) {
+            st.folders = lib.array_remove_at(st.folders, i);
+            lib.rebuild(S);
+            break;
+        }
+        fy += 28;
+    }
+    let np = ui.text_input(U, "s/folder", rx + 18, y + 190, colw - 90, 32, S.new_folder, "Add folder path...");
+    S.new_folder = np;
+    if (ui.icon_button(U, "s/addf", rx + colw - 62, y + 192, 28, "plus", true, "Add folder") || U.submit == "s/folder") {
+        if (len(S.new_folder) > 0 && system.is_dir(S.new_folder)) {
+            push(st.folders, S.new_folder);
+            S.new_folder = "";
+            lib.rebuild(S);
+            ui.toast(U, f"Library: {len(S.tracks)} tracks");
+        } else { ui.toast(U, "Not a folder"); }
+    }
+    // audio / cache / diagnostics
+    ui.panel(U, rx, y + 250, colw, 278, 10);
+    ui.label(rx + 18, y + 264, "AUDIO AND DIAGNOSTICS", T.dim);
+    ui.text_fit(rx + 18, y + 286, colw - 36, E.audio_note, E.silent ? T.warn : T.good, 1);
+    kv(U, T, rx + 18, y + 306, "Version", S.kc_version);
+    kv(U, T, rx + 18, y + 322, "ffmpeg", (S.has_ffmpeg ? "found (mp3/flac/ogg import)" : "not found"));
+    kv(U, T, rx + 18, y + 338, "JIT", (S.jit_note));
+    kv(U, T, rx + 18, y + 354, "Library", f"{len(S.tracks)} tracks, {E.rendered} rendered this session");
+    kv(U, T, rx + 18, y + 370, "Loudness", (E.track != null && st.normalize ? sprintf("%+.1f dB applied to current track", E.norm_db) : "off"));
+    kv(U, T, rx + 18, y + 386, "Render cache", sprintf("%.1f MB of %d MB limit", engine.cache_bytes(E) / 1048576.0, st.cache_mb));
+    var cx2 = rx + 18;
+    for (lim in [200, 500, 1000, 2000]) {
+        if (ui.chip(U, "cm/" + lim, cx2, y + 410, "" + lim + " MB", st.cache_mb == lim)) { st.cache_mb = lim; engine.trim_cache(E, lim); }
+        cx2 += ui.chip_w("" + lim + " MB") + 6;
+    }
+    if (ui.button(U, "s/clear", rx + 18, y + 444, 190, 26, "Clear render cache", "ghost")) {
+        var n = 0;
+        for (f in system.list_dir(E.cache_dir)) { system.remove_file(system.path_join(E.cache_dir, f)); n += 1; }
+        ui.toast(U, f"Removed {n} cached files");
+    }
+    if (ui.button(U, "s/log", rx + 218, y + 444, 190, 26, "Show error log", "ghost")) {
+        let lp = system.path_join(S.data_dir, "error.log");
+        if (system.exists(lp)) { ui.toast(U, "Log: " + lp); } else { ui.toast(U, "No errors logged"); }
+    }
+    ui.text_fit(rx + 18, y + 482, colw - 36, "Errors are caught per frame; playback keeps running.", T.dim, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// track info modal
+// ---------------------------------------------------------------------------------------------
+fn draw_modal(S) -> any {
+    let t = S.modal;
+    if (t == null) { return 0; }
+    let U = S.U;
+    let T = S.T;
+    game.rect(0, 0, U.W, U.H, 0xa0000000);
+    let w = 460;
+    let h = 300;
+    let x = idiv(U.W - w, 2);
+    let y = idiv(U.H - h, 2);
+    ui.shadow(x, y, w, h, 12);
+    ui.rrect_border(x, y, w, h, 12, T.panel, 1, T.line);
+    ui.cover(x + 20, y + 20, 110, t.seed, 0.0, T);
+    ui.text_fit(x + 150, y + 24, w - 170, t.title, T.text, 2);
+    ui.text_fit(x + 150, y + 50, w - 170, t.artist, T.dim, 1);
+    var rows = [["Album", t.album], ["Genre", t.genre], ["Length", t.dur > 0.0 ? ui.fmt_time(t.dur) : "unknown"],
+                ["Source", t.kind == "gen" ? "generated: " + t.style : t.kind], ["Plays", "" + t.plays]];
+    if (t.kind == "gen") { push(rows, ["Options", t.opts]); } else { push(rows, ["File", t.src]); }
+    var yy = y + 70;
+    for (r in rows) {
+        ui.text(x + 150, yy, r[0], T.dim, 1);
+        ui.text_fit(x + 210, yy, w - 230, r[1], T.text, 1);
+        yy += 20;
+    }
+    if (ui.button(U, "modal/close", x + w - 110, y + h - 48, 90, 32, "Close", "primary") || game.key_pressed("escape")) { S.modal = null; }
+    if (ui.button(U, "modal/play", x + w - 210, y + h - 48, 90, 32, "Play", "ghost")) { core.play_ctx(S, t, [t]); S.modal = null; }
+}

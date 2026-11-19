@@ -1,0 +1,19 @@
+title "Lantern Waltz"
+composer Cobra Labs
+tempo 138
+time 3/4
+key G
+
+track melody piano vol=0.9 reverb=0.25
+o5
+D5:q G5:e A5:e B5:q B5:q C6:e B5:e A5:h G5:q
+E5:q A5:e B5:e C6:q C6:q D6:e C6:e B5:h A5:q
+D5:q G5:e A5:e B5:q B5:q C6:e B5:e A5:h G5:q
+B5:q A5:q F#5:q G5:h.
+
+track bass pluck vol=0.8
+o2
+G2:q [D3 B3]:q [D3 B3]:q  G2:q [D3 B3]:q [D3 B3]:q
+C3:q [E3 G3]:q [E3 G3]:q  D3:q [F#3 A3]:q [F#3 A3]:q
+G2:q [D3 B3]:q [D3 B3]:q  G2:q [D3 B3]:q [D3 B3]:q
+D3:q [F#3 A3]:q [F#3 A3]:q G2:h.

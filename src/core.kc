@@ -1,0 +1,371 @@
+// core.kc — application state and every "verb" of the player: play, next, previous, queue, shuffle,
+// repeat, sleep timer, auto-advance, prefetching and persistence.
+import std.game;
+import std.music_note;
+import std.system;
+import std.io;
+import "engine.kc" as engine;
+import "library.kc" as lib;
+import "ui.kc" as ui;
+import "theme.kc" as theme;
+import "viz.kc" as viz;
+import "studio.kc" as studio;
+
+fn new_state(data_dir, app_dir) -> any {
+    system.mkdir(data_dir, true);
+    let home = system.home_dir();
+    var folders = [system.path_join(app_dir, "music")];
+    if (home != null) { folders = [system.path_join(app_dir, "music"), system.path_join(home, "Music")]; }
+    let S = {
+        data_dir: data_dir, app_dir: app_dir,
+        settings: { theme: "Midnight", viz_mode: 0, viz_pal: 0, folders: folders, shuffle: false, repeat: 0, sleep_min: 0,
+                    invert_scroll: false, show_mini_viz: true, autoplay_next: true, normalize: true, cache_mb: 500 },
+        favs: {}, plays: {}, playlists: [], recent: [], recent_few: [], last_id: "",
+        tracks: [], byid: {}, list: [], list_sig: "", query: "", genre: "All", sort_col: "added", sort_asc: true, fav_rev: 0,
+        view: "library", queue: [], qi: -1, history: [], pl_sel: 0, pl_name: "", pl_pick: null,
+        T: theme.make("Midnight"), U: ui.new(), V: viz.new(), E: engine.new(data_dir, app_dir),
+        st: studio.new_state(), roll: null, roll_id: "", roll_mute: [], loading: null, sleep_at: -1.0, autosave_t: 0.0, quit: false,
+        new_folder: "", sel: "", modal: null, status: "", t_start: system.monotonic(), ctx_track: null, mini: false, ui_t: 0.0, rolled_err: "", kc_version: "", has_ffmpeg: false, jit_note: "", fault: false, errors: [], studio_sig: ""
+    };
+    return S;
+}
+
+fn init(S) {
+    lib.load_state(S, S.E);
+    lib.sanitize(S, S.E, theme.names());
+    lib.rebuild(S);
+    engine.trim_cache(S.E, S.settings.cache_mb);
+    S.T = theme.make(S.settings.theme);
+    S.U.invert_scroll = S.settings.invert_scroll;
+    srand(int(system.time()));
+    S.has_ffmpeg = system.which("ffmpeg") != null;
+    let exe = system.exe_path();
+    var v = exe != null ? system.output(exe + " --version") : null;
+    S.kc_version = v != null ? v : "unknown";
+    let jv = exe != null ? system.output(exe + " info") : null;
+    S.jit_note = "see `kingcobra info`";
+    if (jv != null) {
+        for (ln in jv.split("\n")) { if ("JIT" in ln) { S.jit_note = ln.trim(); } }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// score for the piano roll
+// ---------------------------------------------------------------------------------------------
+fn ensure_roll(S, t) -> any {
+    if (S.roll_id == t.id) { return 0; }
+    S.roll = null;
+    S.roll_id = t.id;
+    S.rolled_err = "";
+    try {
+        if (t.kind == "gen") { S.roll = viz.build_roll(music_note.groove(t.style, t.opts)); }
+        else if (t.kind == "kcm") { S.roll = viz.build_roll(music_note.parse_file(t.src)); }
+        else if (t.kind == "studio") { S.roll = viz.build_roll(t.text); }
+    } catch (e) {
+        S.rolled_err = e.message;
+        S.roll = null;
+    }
+    S.roll_mute = [];
+}
+
+// ---------------------------------------------------------------------------------------------
+// starting tracks
+// ---------------------------------------------------------------------------------------------
+fn current(S) -> any {
+    return S.E.track;
+}
+
+fn push_history(S, t) {
+    if (len(S.history) == 0 || S.history[len(S.history) - 1] != t.id) { push(S.history, t.id); }
+    if (len(S.history) > 200) { S.history = S.history[len(S.history) - 200..len(S.history)]; }
+    var rec = [t.id];
+    for (id in S.recent) { if (id != t.id && len(rec) < 12) { push(rec, id); } }
+    S.recent = rec;
+}
+
+// begin playing `t`. If its audio still has to be rendered, a background job starts and the UI shows progress.
+fn start_track(S, t, record) -> any {
+    let E = S.E;
+    let r = engine.request(E, t);
+    if (r == "error") {
+        ui.toast(S.U, "Cannot prepare: " + t.title);
+        return false;
+    }
+    S.loading = t;
+    E.want_play = true;
+    if (record) { push_history(S, t); }
+    if (r == "ready") { finish_loading(S); }
+    else { ui.toast(S.U, "Rendering " + t.title + " ..."); }
+    return true;
+}
+
+fn finish_loading(S) -> any {
+    let t = S.loading;
+    if (t == null) { return 0; }
+    let E = S.E;
+    if (!engine.load(E, t)) {
+        ui.toast(S.U, "Load failed: " + E.err);
+        S.loading = null;
+        return 0;
+    }
+    t.dur = E.dur;
+    viz.reset(S.V);
+    ensure_roll(S, t);
+    lib.count_play(S, t);
+    S.loading = null;
+    game.title("Cobra Music Studio - " + t.title);
+    if (E.want_play) { engine.play(E); }
+    if (E.err != "") { ui.toast(S.U, E.err); E.err = ""; }
+}
+
+// play `t` and make `ctx` (array of tracks) the queue
+fn play_ctx(S, t, ctx) {
+    var q = [];
+    var qi = 0;
+    for (i in 0..len(ctx)) {
+        push(q, ctx[i].id);
+        if (ctx[i].id == t.id) { qi = i; }
+    }
+    S.queue = q;
+    S.qi = qi;
+    start_track(S, t, true);
+}
+
+fn toggle_play(S) -> any {
+    let E = S.E;
+    if (E.raw == null) {
+        if (len(S.queue) > 0 && S.qi >= 0) {
+            let t = lib.find(S, S.queue[S.qi]);
+            if (t != null) { start_track(S, t, true); }
+        } else if (len(S.tracks) > 0) {
+            play_ctx(S, S.tracks[0], lib.view_list(S));
+        }
+        return 0;
+    }
+    engine.toggle(E);
+}
+
+fn pick_shuffle(S) -> any {
+    let n = len(S.queue);
+    if (n <= 1) { return S.qi; }
+    var tries = 0;
+    var i = S.qi;
+    while (tries < 8) {
+        i = rand() % n;
+        if (i != S.qi && !(S.queue[i] in S.recent_few) ) { return i; }
+        tries += 1;
+    }
+    return (S.qi + 1) % n;
+}
+
+// dir = +1 next, -1 previous. auto = true when the previous track ended by itself.
+fn advance(S, dir, auto) -> any {
+    let E = S.E;
+    let n = len(S.queue);
+    if (n == 0) { return 0; }
+    if (auto && S.settings.repeat == 2 && E.track != null) {
+        start_track(S, E.track, true);
+        return 0;
+    }
+    if (dir < 0) {
+        if (E.state != "stopped" && engine.position(E) > 3.0) { engine.seek(E, 0.0); return 0; }
+        // go back through the history
+        if (len(S.history) >= 2) {
+            let prev_id = S.history[len(S.history) - 2];
+            S.history = S.history[0..len(S.history) - 2];
+            let t = lib.find(S, prev_id);
+            if (t != null) {
+                for (i in 0..n) { if (S.queue[i] == prev_id) { S.qi = i; } }
+                start_track(S, t, true);
+                return 0;
+            }
+        }
+        S.qi = (S.qi - 1 + n) % n;
+        let t = lib.find(S, S.queue[S.qi]);
+        if (t != null) { start_track(S, t, true); }
+        return 0;
+    }
+    var ni = S.qi + 1;
+    if (S.settings.shuffle) {
+        S.recent_few = S.history[max(0, len(S.history) - min(n - 1, 3))..len(S.history)];
+        ni = pick_shuffle(S);
+    } else if (ni >= n) {
+        if (S.settings.repeat == 1) { ni = 0; }
+        else if (auto) {
+            // end of the queue: stop
+            engine.stop(E);
+            ui.toast(S.U, "End of queue");
+            return 0;
+        } else { ni = 0; }
+    }
+    S.qi = ni;
+    let t = lib.find(S, S.queue[ni]);
+    if (t != null) { start_track(S, t, true); }
+}
+
+fn enqueue(S, t, next_flag) -> any {
+    if (len(S.queue) == 0 || S.qi < 0) {
+        S.queue = [t.id];
+        S.qi = 0;
+        start_track(S, t, true);
+        return 0;
+    }
+    var out = [];
+    for (i in 0..len(S.queue)) {
+        push(out, S.queue[i]);
+        if (next_flag && i == S.qi) { push(out, t.id); }
+    }
+    if (!next_flag) { push(out, t.id); }
+    S.queue = out;
+    ui.toast(S.U, (next_flag ? "Playing next: " : "Queued: ") + t.title);
+}
+
+fn queue_remove(S, i) -> any {
+    if (i == S.qi) { return 0; }
+    S.queue = lib.array_remove_at(S.queue, i);
+    if (i < S.qi) { S.qi -= 1; }
+}
+
+fn queue_swap(S, i, j) -> any {
+    if (i < 0 || j < 0 || i >= len(S.queue) || j >= len(S.queue)) { return 0; }
+    S.queue = lib.array_move(S.queue, i, j);
+    if (S.qi == i) { S.qi = j; } else if (S.qi == j) { S.qi = i; }
+}
+
+fn queue_shuffle(S) {
+    let n = len(S.queue);
+    var cur = S.qi >= 0 && S.qi < n ? S.queue[S.qi] : "";
+    var rest = [];
+    for (i in 0..n) { if (i != S.qi) { push(rest, S.queue[i]); } }
+    var k = len(rest) - 1;
+    while (k > 0) {
+        let j = rand() % (k + 1);
+        let v = rest[k];
+        rest[k] = rest[j];
+        rest[j] = v;
+        k -= 1;
+    }
+    var out = [];
+    if (cur != "") { push(out, cur); }
+    for (id in rest) { push(out, id); }
+    S.queue = out;
+    S.qi = cur != "" ? 0 : -1;
+}
+
+fn set_shuffle(S, on) {
+    S.settings.shuffle = on;
+    ui.toast(S.U, on ? "Shuffle on" : "Shuffle off");
+}
+
+fn cycle_repeat(S) {
+    S.settings.repeat = (S.settings.repeat + 1) % 3;
+    let names = ["Repeat off", "Repeat all", "Repeat one"];
+    ui.toast(S.U, names[S.settings.repeat]);
+}
+
+fn toggle_fav(S, t) {
+    lib.set_fav(S, t, !t.fav);
+    ui.toast(S.U, t.fav ? "Added to favorites" : "Removed from favorites");
+}
+
+fn set_theme(S, name) {
+    S.settings.theme = name;
+    S.T = theme.make(name);
+}
+
+fn set_sleep(S, minutes) {
+    S.settings.sleep_min = minutes;
+    if (minutes <= 0) { S.sleep_at = -1.0; ui.toast(S.U, "Sleep timer off"); }
+    else {
+        S.sleep_at = system.monotonic() + minutes * 60.0;
+        ui.toast(S.U, f"Sleep timer: {minutes} min");
+    }
+}
+
+fn set_volume(S, v) {
+    let E = S.E;
+    E.vol = clamp(v, 0.0, 1.0);
+    if (E.vol > 0.0) { E.muted = false; }
+    engine.changed(E);
+}
+
+fn toggle_mute(S) {
+    S.E.muted = !S.E.muted;
+    engine.changed(S.E);
+}
+
+fn seek_by(S, dt) -> any {
+    let E = S.E;
+    if (E.raw == null) { return 0; }
+    engine.seek(E, engine.position(E) + dt);
+}
+
+// ---------------------------------------------------------------------------------------------
+// per-frame housekeeping
+// ---------------------------------------------------------------------------------------------
+fn tick(S, dt) {
+    let E = S.E;
+    E.pos_cache = engine.position(E);
+    engine.tick(E, S.U.active != "");
+    let r = engine.poll_job(E);
+    if (r != null) {
+        if (r.failed) {
+            ui.toast(S.U, E.err);
+            if (S.loading != null) { S.loading = null; E.want_play = false; }
+        } else {
+            engine.trim_cache(E, S.settings.cache_mb);
+            if (S.loading != null && r.track.id == S.loading.id) { finish_loading(S); }
+        }
+    }
+    // a user-requested track still waiting while a (cancelled/other) job finished: ask again
+    if (S.loading != null && E.job == null && !engine.is_ready(E, S.loading)) {
+        let rr = engine.request(E, S.loading);
+        if (rr == "error") { S.loading = null; }
+    }
+    if (E.ended) {
+        E.ended = false;
+        if (S.settings.autoplay_next) { advance(S, 1, true); }
+    }
+    // prefetch the next queued track once the current one is a few seconds in
+    if (E.state == "playing" && E.job == null && S.loading == null && E.pos_cache > 4.0 && len(S.queue) > 1) {
+        var ni = (S.qi + 1) % len(S.queue);
+        if (!S.settings.shuffle && ni != 0 || S.settings.repeat == 1) {
+            let nt = lib.find(S, S.queue[ni]);
+            if (nt != null && !engine.is_ready(E, nt)) { engine.spawn_job(E, nt, true); }
+        }
+    }
+    if (S.sleep_at > 0.0 && system.monotonic() >= S.sleep_at) {
+        S.sleep_at = -1.0;
+        S.settings.sleep_min = 0;
+        engine.pause(E);
+        ui.toast(S.U, "Sleep timer: paused");
+    }
+    S.autosave_t += dt;
+    if (S.autosave_t > 30.0) {
+        S.autosave_t = 0.0;
+        lib.save(S, E);
+        studio.autosave(S);
+    }
+    E.norm = S.settings.normalize;
+}
+
+fn shutdown(S) {
+    lib.save(S, S.E);
+    engine.shutdown(S.E);
+}
+
+// append one line to <data>/error.log and remember it (for the crash guard)
+fn log_error(S, where, msg) {
+    let line = f"[{int(system.time())}] {where}: {msg}\n";
+    try { io.append_file(system.path_join(S.data_dir, "error.log"), line); } catch (e) { }
+    push(S.errors, system.monotonic());
+    if (len(S.errors) > 8) { S.errors = S.errors[len(S.errors) - 8..len(S.errors)]; }
+}
+
+// true when several faults happened within a few seconds (then the app falls back to a safe screen)
+fn fault_storm(S) -> any {
+    let now = system.monotonic();
+    var n = 0;
+    for (t in S.errors) { if (now - t < 5.0) { n += 1; } }
+    return n >= 4;
+}
