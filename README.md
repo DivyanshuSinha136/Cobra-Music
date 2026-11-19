@@ -273,7 +273,6 @@ cobra_music/
 * Changing volume, EQ or speed re-renders the rest of the track, so there is a short gap (about 0.1 to 0.4 s) when you release a control.
 * The window size is fixed at start-up (`--size WxH`); `std.game` has no live-resize call.
 * Fonts have no kerning or hinting (grayscale anti-aliasing only).
-* Verified on Linux (X11 and headless). The Windows playback path (PowerShell SoundPlayer) is untested.
 
 <h2 id="credits-and-license"><img src="docs/img/icons/heart.svg" width="26" height="26" align="top" alt="">&nbsp;Credits and license</h2>
 
